@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Database\Migrations\*.sql" />
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TPVOne.LegacyAccess.Core\TPVOne.LegacyAccess.Core.csproj" />
+    <ProjectReference Include="..\TPVOne.LegacyAccessImporter\TPVOne.LegacyAccessImporter.csproj"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="CopyLegacyAccessImporter" AfterTargets="Build">
+    <ItemGroup>
+      <LegacyImporterFiles Include="$(MSBuildThisFileDirectory)..\TPVOne.LegacyAccessImporter\bin\$(Configuration)\net10.0-windows\win-x86\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(LegacyImporterFiles)"
+          DestinationFiles="@(LegacyImporterFiles->'$(OutDir)LegacyAccessImporter\%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+
+</Project>
