@@ -1,5 +1,6 @@
 using System.Globalization;
 using TPVOne.LegacyAccess.Core.Binary;
+using TPVOne.LegacyAccess.Core.Classification;
 using TPVOne.LegacyAccess.Core.Exceptions;
 using TPVOne.LegacyAccess.Core.Models;
 
@@ -28,7 +29,8 @@ public sealed class LegacyValueConverter
                     decimal.Parse(raw.Trim(), CultureInfo.InvariantCulture),
                 "DBBOOLEAN" => ParseBoolean(raw),
                 "DBDATE" => ParseDate(raw),
-                "DBTEXT" or "DBMEMO" => raw,
+                "DBTEXT" => raw,
+                "DBMEMO" => DecodeMemoText(raw),
                 "DBBINARY" or "DBLONGBINARY" => DecodeBinary(raw),
                 "DBGUID" => Guid.Parse(raw.Trim()),
                 _ => throw new DataImportException(
@@ -103,6 +105,11 @@ public sealed class LegacyValueConverter
         }
 
         throw new FormatException($"Fecha no reconocida: '{value}'.");
+    }
+
+    private static string DecodeMemoText(string raw)
+    {
+        return Utf16LeTextCodec.DecodeBase64(raw);
     }
 
     private static byte[] DecodeBinary(string raw)

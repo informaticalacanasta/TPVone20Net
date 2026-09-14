@@ -146,6 +146,96 @@ public sealed class LegacySourceTests
     }
 
     [Fact]
+    public void DaoMapper_DbMemoMapsToNvarcharMax()
+    {
+        Assert.Equal("nvarchar(max)", _mapper.Map(Column("COMPOSICIO", "dbMemo")).ToSql());
+    }
+
+    [Fact]
+    public void Converter_DbMemoClrTypeIsString()
+    {
+        Assert.Equal(typeof(string), new LegacyValueConverter().GetClrType(Column("COMPOSICIO", "dbMemo")));
+    }
+
+    [Fact]
+    public void Converter_DbTextClrTypeRemainsString()
+    {
+        Assert.Equal(typeof(string), new LegacyValueConverter().GetClrType(Column("DESCRIPCIO", "dbText", 30)));
+    }
+
+    [Fact]
+    public void Converter_DbTextDoesNotDecodeBase64()
+    {
+        var result = new LegacyValueConverter().ConvertValue("SG9sYQ==", Column("DESCRIPCIO", "dbText", 30));
+        Assert.Equal("SG9sYQ==", result);
+    }
+
+    [Fact]
+    public void Converter_DbMemoDecodesUtf16LeBase64ToText()
+    {
+        var original = "Ingredientes";
+        var result = new LegacyValueConverter().ConvertValue(
+            Convert.ToBase64String(Encoding.Unicode.GetBytes(original)),
+            Column("COMPOSICIO", "dbMemo"));
+        Assert.Equal(original, result);
+    }
+
+    [Fact]
+    public void Converter_DbMemoPreservesSpanishCharacters()
+    {
+        var original = "jamón de york untado con paté";
+        var result = new LegacyValueConverter().ConvertValue(
+            Convert.ToBase64String(Encoding.Unicode.GetBytes(original)),
+            Column("COMPOSICIO", "dbMemo"));
+        Assert.Equal(original, result);
+    }
+
+    [Fact]
+    public void Converter_DbMemoPreservesLineBreaks()
+    {
+        var original = "PAN DE CENTENO\r\n\r\nPan de molde de CENTENO.\r\n\r\nIdeal con platos de caza.";
+        var result = new LegacyValueConverter().ConvertValue(
+            Convert.ToBase64String(Encoding.Unicode.GetBytes(original)),
+            Column("COMPOSICIO", "dbMemo"));
+        Assert.Equal(original, result);
+    }
+
+    [Fact]
+    public void Converter_DbMemoEmptyIsDbNull()
+    {
+        Assert.Same(DBNull.Value, new LegacyValueConverter().ConvertValue("", Column("COMPOSICIO", "dbMemo")));
+    }
+
+    [Fact]
+    public void Converter_DbMemoInvalidBase64Throws()
+    {
+        var exception = Assert.Throws<DataImportException>(
+            () => new LegacyValueConverter().ConvertValue("NO_ES_BASE64", Column("COMPOSICIO", "dbMemo")));
+        Assert.Contains("COMPOSICIO", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("dbMemo", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("NO_ES_BASE64", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Converter_DbMemoOddUtf16LengthThrows()
+    {
+        var encoded = Convert.ToBase64String([0x41, 0x00, 0x42]);
+        var exception = Assert.Throws<DataImportException>(
+            () => new LegacyValueConverter().ConvertValue(encoded, Column("COMPOSICIO", "dbMemo")));
+        Assert.Contains("UTF-16LE", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Converter_DbLongBinaryStillReturnsBytes()
+    {
+        var payload = "BMPDATA"u8.ToArray();
+        var result = new LegacyValueConverter().ConvertValue(
+            Convert.ToBase64String(payload),
+            Column("FOTO_activado", "dbLongBinary"));
+        Assert.Equal(payload, Assert.IsType<byte[]>(result));
+    }
+
+    [Fact]
     public async Task SchemaOnly_CreatesTableWithoutCsv()
     {
         using var directory = new TempDir();
@@ -209,6 +299,65 @@ public sealed class LegacySourceTests
         Assert.Equal(DataStatus.Imported, result.Tables[0].DataStatus);
         Assert.Equal(1, result.Tables[0].ImportedRowCount);
         Assert.True(result.IsSuccessful);
+    }
+
+    [Fact]
+    public async Task Utf16LegacyBinaryColumn_IsCreatedAsNvarcharWithoutNameHardcode()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(
+            Path.Combine(directory.Path, "articulos.txt"),
+            """
+            Nombre Tabla=articulos
+            Estructura:
+            Nombre Campo=id Tipo=dbLong Entero largo, size=4
+            Nombre Campo=COMPOSICIO Tipo=dbLongBinary
+            Nombre Campo=FOTO Tipo=dbLongBinary
+            """);
+        var text = Convert.ToBase64String(Encoding.Unicode.GetBytes("PAN DE CENTENO ALEMAN"));
+        var foto = Convert.ToBase64String(MinimalBmp());
+        File.WriteAllText(
+            Path.Combine(directory.Path, "articulos.csv"),
+            $"id|COMPOSICIO|FOTO|\n1|{text}|{foto}|\n");
+        var sql = new FakeSql();
+        var interaction = FakeInteraction.Unexpected();
+        var result = await Import(directory.Path, sql, new FakeCopy(), interaction: interaction);
+
+        Assert.True(result.IsSuccessful);
+        Assert.Equal("dbMemo", sql.Created["articulos"].Columns[1].SourceTypeName);
+        Assert.Equal("nvarchar(max)", _mapper.Map(sql.Created["articulos"].Columns[1]).ToSql());
+        Assert.Equal("dbLongBinary", sql.Created["articulos"].Columns[2].SourceTypeName);
+        Assert.Equal("varbinary(max)", _mapper.Map(sql.Created["articulos"].Columns[2]).ToSql());
+        Assert.Contains(
+            interaction.Messages,
+            message => message.Contains("COMPOSICIO", StringComparison.OrdinalIgnoreCase)
+                && message.Contains("nvarchar(max)", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(
+            interaction.Messages,
+            message => message.Contains("FOTO", StringComparison.OrdinalIgnoreCase)
+                && message.Contains("varbinary", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Reader_Utf16Memo_ExposesStringAndFotoExposesBytes()
+    {
+        using var directory = new TempDir();
+        var path = Path.Combine(directory.Path, "articulos.csv");
+        var text = Convert.ToBase64String(Encoding.Unicode.GetBytes("Hola"));
+        File.WriteAllText(path, $"COMPOSICIO|FOTO|\n{text}||\n");
+        var schema = new LegacyTableSchema(
+            "articulos",
+            [
+                new("COMPOSICIO", "dbMemo", null, null, null, 0, true, false),
+                new("FOTO", "dbLongBinary", null, null, null, 1, true, false)
+            ],
+            []);
+        using var reader = new CsvLegacyDataSource(path).OpenReader(schema);
+
+        Assert.Equal(typeof(string), reader.GetFieldType(0));
+        Assert.Equal(typeof(byte[]), reader.GetFieldType(1));
+        Assert.True(reader.Read());
+        Assert.Equal("Hola", reader.GetString(0));
     }
 
     [Fact]

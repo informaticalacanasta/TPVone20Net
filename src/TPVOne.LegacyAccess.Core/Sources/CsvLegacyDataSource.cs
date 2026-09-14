@@ -50,6 +50,59 @@ public sealed class CsvLegacyDataSource : ILegacyDataSource
         return new CsvLegacyDataReader(OpenRecordReader(), schema, _converter);
     }
 
+    public IReadOnlyDictionary<int, IReadOnlyList<string>> SampleNonEmptyValues(
+        IReadOnlyCollection<int> ordinals,
+        int targetPerColumn,
+        int maxRows)
+    {
+        var collected = ordinals.Distinct().ToDictionary(
+            ordinal => ordinal,
+            _ => new List<string>());
+        if (collected.Count == 0)
+        {
+            return collected.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<string>)pair.Value);
+        }
+
+        using var reader = OpenRecordReader();
+        var header = reader.ReadHeader()
+            ?? throw new InvalidDataException($"El CSV '{Location}' no contiene cabecera.");
+        var rows = 0;
+        while (rows < maxRows && collected.Values.Any(values => values.Count < targetPerColumn))
+        {
+            var record = reader.ReadRecord(header.Count);
+            if (record is null)
+            {
+                break;
+            }
+
+            rows++;
+            foreach (var ordinal in collected.Keys.ToArray())
+            {
+                if (ordinal < 0 || ordinal >= record.Count)
+                {
+                    continue;
+                }
+
+                if (collected[ordinal].Count >= targetPerColumn)
+                {
+                    continue;
+                }
+
+                var value = record[ordinal];
+                if (value.Length > 0)
+                {
+                    collected[ordinal].Add(value);
+                }
+            }
+        }
+
+        return collected.ToDictionary(
+            pair => pair.Key,
+            pair => (IReadOnlyList<string>)pair.Value);
+    }
+
     private PipeDelimitedRecordReader OpenRecordReader()
     {
         var encoding = TextEncodingDetector.Resolve(Location, _defaultEncodingName);

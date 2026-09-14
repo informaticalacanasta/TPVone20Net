@@ -1,3 +1,4 @@
+using System.Text;
 using Microsoft.Data.SqlClient;
 using TPVOne.LegacyAccess.Core.Import;
 using TPVOne.LegacyAccess.Core.Mapping;
@@ -74,6 +75,48 @@ public sealed class IsolatedSqlTests
         var foto = await database.ReadColumnTypeAsync("alergenos", "FOTO_activado");
         Assert.Equal("varbinary", foto.TypeName, StringComparer.OrdinalIgnoreCase);
         Assert.Equal(-1, foto.MaxLength);
+    }
+
+    [SqlFact]
+    public async Task DbMemo_IsImportedAsNvarcharText()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        const string expected = "Texto de prueba con jamón y paté";
+        using var source = DbMemoFixture.Create(expected);
+
+        var result = await ImportAsync(database, source.Path);
+        var column = await database.ReadColumnTypeAsync("receta", "COMPOSICIO");
+        var stored = await database.ReadNVarCharAsync("receta", "COMPOSICIO", "id", 1);
+
+        Assert.True(result.IsSuccessful);
+        Assert.Equal(SchemaStatus.Created, result.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.Imported, result.Tables[0].DataStatus);
+        Assert.Equal("nvarchar", column.TypeName, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(-1, column.MaxLength);
+        Assert.Equal(expected, stored);
+    }
+
+    [SqlFact]
+    public async Task LongBinaryUtf16Text_IsImportedAsNvarchar_WhileFotoStaysVarbinary()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        const string expectedText = "PAN DE CENTENO ALEMAN DE GRANO GRUESO";
+        var expectedFoto = BinaryTextFixture.MinimalBmp();
+        using var source = BinaryTextFixture.Create(expectedText, expectedFoto);
+
+        var result = await ImportAsync(database, source.Path);
+        var composicio = await database.ReadColumnTypeAsync("articulos", "COMPOSICIO");
+        var foto = await database.ReadColumnTypeAsync("articulos", "FOTO");
+        var storedText = await database.ReadNVarCharAsync("articulos", "COMPOSICIO", "id", 1);
+        var storedFoto = await database.ReadBinaryAsync("articulos", "FOTO", "id", 1);
+
+        Assert.True(result.IsSuccessful);
+        Assert.Equal("nvarchar", composicio.TypeName, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(-1, composicio.MaxLength);
+        Assert.Equal(expectedText, storedText);
+        Assert.Equal("varbinary", foto.TypeName, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(-1, foto.MaxLength);
+        Assert.Equal(expectedFoto, storedFoto);
     }
 
     [SqlFact]
@@ -197,6 +240,65 @@ internal sealed class SqlFactAttribute : FactAttribute
         {
             Skip = "SQL Server no está disponible en localhost.";
         }
+    }
+}
+
+file static class BinaryTextFixture
+{
+    public static TempDir Create(string composicio, byte[] foto)
+    {
+        var directory = new TempDir();
+        File.WriteAllText(
+            Path.Combine(directory.Path, "articulos.txt"),
+            """
+            Nombre Tabla=articulos
+            Estructura:
+            Nombre Campo=id Tipo=dbLong Entero largo, size=4
+            Nombre Campo=COMPOSICIO Tipo=dbLongBinary
+            Nombre Campo=FOTO Tipo=dbLongBinary
+            """);
+        var text = Convert.ToBase64String(Encoding.Unicode.GetBytes(composicio));
+        var image = Convert.ToBase64String(foto);
+        File.WriteAllText(
+            Path.Combine(directory.Path, "articulos.csv"),
+            $"id|COMPOSICIO|FOTO|\n1|{text}|{image}|\n");
+        return directory;
+    }
+
+    public static byte[] MinimalBmp()
+    {
+        var data = new byte[58];
+        data[0] = 0x42;
+        data[1] = 0x4D;
+        BitConverter.GetBytes(58).CopyTo(data, 2);
+        BitConverter.GetBytes(54).CopyTo(data, 10);
+        BitConverter.GetBytes(40).CopyTo(data, 14);
+        BitConverter.GetBytes(1).CopyTo(data, 18);
+        BitConverter.GetBytes(1).CopyTo(data, 22);
+        BitConverter.GetBytes((short)1).CopyTo(data, 26);
+        BitConverter.GetBytes((short)24).CopyTo(data, 28);
+        return data;
+    }
+}
+
+file static class DbMemoFixture
+{
+    public static TempDir Create(string text)
+    {
+        var directory = new TempDir();
+        File.WriteAllText(
+            Path.Combine(directory.Path, "receta.txt"),
+            """
+            Nombre Tabla=receta
+            Estructura:
+            Nombre Campo=id Tipo=dbLong Entero largo, size=4
+            Nombre Campo=COMPOSICIO Tipo=dbMemo
+            """);
+        var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(text));
+        File.WriteAllText(
+            Path.Combine(directory.Path, "receta.csv"),
+            $"id|COMPOSICIO|\n1|{encoded}|\n");
+        return directory;
     }
 }
 
@@ -385,6 +487,44 @@ internal sealed class IsolatedSqlDatabase : IAsyncDisposable
             $"SELECT COUNT_BIG(*) FROM dbo.[{tableName.Replace("]", "]]", StringComparison.Ordinal)}];",
             connection);
         return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    public async Task<byte[]?> ReadBinaryAsync(
+        string tableName,
+        string columnName,
+        string idColumn,
+        int id)
+    {
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        var quotedTable = tableName.Replace("]", "]]", StringComparison.Ordinal);
+        var quotedColumn = columnName.Replace("]", "]]", StringComparison.Ordinal);
+        var quotedId = idColumn.Replace("]", "]]", StringComparison.Ordinal);
+        await using var command = new SqlCommand(
+            $"SELECT [{quotedColumn}] FROM dbo.[{quotedTable}] WHERE [{quotedId}] = @Id;",
+            connection);
+        command.Parameters.AddWithValue("@Id", id);
+        var value = await command.ExecuteScalarAsync();
+        return value is null or DBNull ? null : (byte[])value;
+    }
+
+    public async Task<string?> ReadNVarCharAsync(
+        string tableName,
+        string columnName,
+        string idColumn,
+        int id)
+    {
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        var quotedTable = tableName.Replace("]", "]]", StringComparison.Ordinal);
+        var quotedColumn = columnName.Replace("]", "]]", StringComparison.Ordinal);
+        var quotedId = idColumn.Replace("]", "]]", StringComparison.Ordinal);
+        await using var command = new SqlCommand(
+            $"SELECT [{quotedColumn}] FROM dbo.[{quotedTable}] WHERE [{quotedId}] = @Id;",
+            connection);
+        command.Parameters.AddWithValue("@Id", id);
+        var value = await command.ExecuteScalarAsync();
+        return value is null or DBNull ? null : (string)value;
     }
 
     public async Task ExecuteAsync(string sql)

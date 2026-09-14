@@ -12,4 +12,9 @@ public interface ILegacyDataSource
     long CountRecords();
 
     IDataReader OpenReader(LegacyTableSchema schema);
+
+    IReadOnlyDictionary<int, IReadOnlyList<string>> SampleNonEmptyValues(
+        IReadOnlyCollection<int> ordinals,
+        int targetPerColumn,
+        int maxRows);
 }

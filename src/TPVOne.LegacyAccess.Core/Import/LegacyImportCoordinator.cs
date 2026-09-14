@@ -1,3 +1,4 @@
+using TPVOne.LegacyAccess.Core.Classification;
 using TPVOne.LegacyAccess.Core.Data;
 using TPVOne.LegacyAccess.Core.Exceptions;
 using TPVOne.LegacyAccess.Core.Mapping;
@@ -19,6 +20,7 @@ public sealed class LegacyImportCoordinator
     private readonly ILegacyImportHistoryPort? _history;
     private readonly LegacyImportOptions _options;
     private readonly ILegacyImportInteraction _interaction;
+    private readonly IBinaryColumnClassifier _binaryClassifier;
 
     public LegacyImportCoordinator(
         ILegacyTableSourceScanner scanner,
@@ -28,7 +30,8 @@ public sealed class LegacyImportCoordinator
         ILegacyDataCopyPort? dataCopy,
         ILegacyImportHistoryPort? history,
         LegacyImportOptions options,
-        ILegacyImportInteraction? interaction = null)
+        ILegacyImportInteraction? interaction = null,
+        IBinaryColumnClassifier? binaryClassifier = null)
     {
         _scanner = scanner;
         _typeMapper = typeMapper;
@@ -38,6 +41,7 @@ public sealed class LegacyImportCoordinator
         _history = history;
         _options = options;
         _interaction = interaction ?? NullLegacyImportInteraction.Instance;
+        _binaryClassifier = binaryClassifier ?? new BinaryColumnClassifier();
     }
 
     public async Task<PipelineResult> AnalyzeAsync(CancellationToken cancellationToken = default)
@@ -274,15 +278,23 @@ public sealed class LegacyImportCoordinator
             }
         }
 
+        var effectiveSchema = schema;
+        if (source.DataSource is not null && dataError is null)
+        {
+            var kinds = _binaryClassifier.Classify(schema, source.DataSource);
+            InformBinaryClassification(schema.Name, schema, kinds);
+            effectiveSchema = EffectiveLegacySchema.Apply(schema, kinds);
+        }
+
         if (!exists)
         {
             _interaction.Inform($"La tabla '{schema.Name}' no existe. Creando...");
-            await _sql.CreateTableAsync(schema, cancellationToken);
-            await _sql.CreateIndexesAsync(schema, cancellationToken);
+            await _sql.CreateTableAsync(effectiveSchema, cancellationToken);
+            await _sql.CreateIndexesAsync(effectiveSchema, cancellationToken);
             return await ImportDataIfAvailableAsync(
                 source,
                 analysis,
-                schema,
+                effectiveSchema,
                 SchemaStatus.Created,
                 created: true,
                 previousRows,
@@ -334,17 +346,47 @@ public sealed class LegacyImportCoordinator
         _interaction.Inform($"Eliminando tabla '{schema.Name}'...");
         await _sql.DropTableAsync(schema.Name, cancellationToken);
         _interaction.Inform($"Creando tabla '{schema.Name}'...");
-        await _sql.CreateTableAsync(schema, cancellationToken);
-        await _sql.CreateIndexesAsync(schema, cancellationToken);
+        await _sql.CreateTableAsync(effectiveSchema, cancellationToken);
+        await _sql.CreateIndexesAsync(effectiveSchema, cancellationToken);
         return await ImportDataIfAvailableAsync(
             source,
             analysis,
-            schema,
+            effectiveSchema,
             SchemaStatus.Replaced,
             created: true,
             previousRows,
             dataError: null,
             cancellationToken);
+    }
+
+    private void InformBinaryClassification(
+        string tableName,
+        LegacyTableSchema schema,
+        IReadOnlyDictionary<string, LegacyBinaryColumnKind> kinds)
+    {
+        foreach (var column in schema.Columns)
+        {
+            if (!kinds.TryGetValue(column.Name, out var kind))
+            {
+                continue;
+            }
+
+            if (kind == LegacyBinaryColumnKind.Utf16Text)
+            {
+                _interaction.Inform(
+                    $"{tableName}.{column.Name}: binario legacy detectado como texto UTF-16LE → nvarchar(max)");
+            }
+            else
+            {
+                var sqlType = _typeMapper.Map(
+                    kind == LegacyBinaryColumnKind.Binary
+                    && column.SourceTypeName.Trim().ToUpperInvariant() == "DBMEMO"
+                        ? column with { SourceTypeName = "dbLongBinary" }
+                        : column).ToSql();
+                _interaction.Inform(
+                    $"{tableName}.{column.Name}: binario real → {sqlType}");
+            }
+        }
     }
 
     private async Task<TableImportResult> HandleExistingSchemaOnlyAsync(
