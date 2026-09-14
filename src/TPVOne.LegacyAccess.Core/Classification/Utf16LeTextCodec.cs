@@ -12,13 +12,12 @@ public static class Utf16LeTextCodec
 
     public static string Decode(byte[] bytes)
     {
-        if (bytes.Length % 2 != 0)
+        if (bytes.Length == 0)
         {
-            throw new FormatException(
-                $"Longitud {bytes.Length} inválida para UTF-16LE.");
+            return string.Empty;
         }
 
-        return Normalize(Utf16Le.GetString(bytes));
+        return Normalize(Utf16Le.GetString(NormalizeLegacyUtf16Le(bytes)));
     }
 
     public static string DecodeBase64(string raw)
@@ -28,19 +27,20 @@ public static class Utf16LeTextCodec
 
     public static bool LooksLikeText(byte[] bytes)
     {
-        if (bytes.Length == 0 || bytes.Length % 2 != 0)
+        if (bytes.Length == 0)
         {
             return false;
         }
 
-        if (!HasUtf16LeLatinPattern(bytes))
+        var candidate = NormalizeLegacyUtf16Le(bytes);
+        if (!HasUtf16LeLatinPattern(candidate))
         {
             return false;
         }
 
         try
         {
-            var text = Normalize(Utf16Le.GetString(bytes));
+            var text = Normalize(Utf16Le.GetString(candidate));
             return text.Length > 0 && IsMostlyReadable(text);
         }
         catch (DecoderFallbackException)
@@ -60,14 +60,9 @@ public static class Utf16LeTextCodec
             return true;
         }
 
-        if (bytes.Length % 2 != 0)
-        {
-            return false;
-        }
-
         try
         {
-            return Normalize(Utf16Le.GetString(bytes)).Length == 0;
+            return Normalize(Utf16Le.GetString(NormalizeLegacyUtf16Le(bytes))).Length == 0;
         }
         catch (DecoderFallbackException)
         {
@@ -77,6 +72,19 @@ public static class Utf16LeTextCodec
         {
             return false;
         }
+    }
+
+    private static byte[] NormalizeLegacyUtf16Le(byte[] bytes)
+    {
+        if (bytes.Length % 2 == 0)
+        {
+            return bytes;
+        }
+
+        var normalized = new byte[bytes.Length + 1];
+        Buffer.BlockCopy(bytes, 0, normalized, 0, bytes.Length);
+        normalized[^1] = 0x00;
+        return normalized;
     }
 
     private static string Normalize(string text)

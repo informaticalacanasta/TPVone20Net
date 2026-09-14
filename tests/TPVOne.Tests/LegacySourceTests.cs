@@ -217,12 +217,11 @@ public sealed class LegacySourceTests
     }
 
     [Fact]
-    public void Converter_DbMemoOddUtf16LengthThrows()
+    public void Converter_DbMemoOddLengthLegacyUtf16Le_DecodesMissingHighByte()
     {
         var encoded = Convert.ToBase64String([0x41, 0x00, 0x42]);
-        var exception = Assert.Throws<DataImportException>(
-            () => new LegacyValueConverter().ConvertValue(encoded, Column("COMPOSICIO", "dbMemo")));
-        Assert.Contains("UTF-16LE", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+        var result = new LegacyValueConverter().ConvertValue(encoded, Column("COMPOSICIO", "dbMemo"));
+        Assert.Equal("AB", result);
     }
 
     [Fact]

@@ -65,10 +65,113 @@ public sealed class BinaryColumnClassifierTests
     }
 
     [Fact]
-    public void OddLength_IsBinaryDuringAnalysis()
+    public void OddLengthLegacyUtf16Le_IsTextWhenOnlyFinalHighByteIsMissing()
     {
         var kind = Classify("payload", "dbLongBinary", [Convert.ToBase64String([0x41, 0x00, 0x42])]);
+        Assert.Equal(LegacyBinaryColumnKind.Utf16Text, kind);
+        Assert.Equal("AB", Utf16LeTextCodec.Decode([0x41, 0x00, 0x42]));
+    }
+
+    [Fact]
+    public void TruncatedIngredi_IsText()
+    {
+        byte[] bytes =
+        [
+            0x49, 0x00,
+            0x6E, 0x00,
+            0x67, 0x00,
+            0x72, 0x00,
+            0x65, 0x00,
+            0x64, 0x00,
+            0x69
+        ];
+        Assert.True(Utf16LeTextCodec.LooksLikeText(bytes));
+        Assert.Equal("Ingredi", Utf16LeTextCodec.Decode(bytes));
+        Assert.Equal("Ingredi", Utf16LeTextCodec.DecodeBase64("SQBuAGcAcgBlAGQAaQ=="));
+    }
+
+    [Fact]
+    public void SingleSpaceByte_IsText()
+    {
+        Assert.True(Utf16LeTextCodec.LooksLikeText([0x20]));
+        Assert.Equal(" ", Utf16LeTextCodec.Decode([0x20]));
+        Assert.Equal(" ", Utf16LeTextCodec.DecodeBase64("IA=="));
+        Assert.Equal(LegacyBinaryColumnKind.Utf16Text, Classify("notas", "dbLongBinary", ["IA=="]));
+    }
+
+    [Fact]
+    public void SingleCarriageReturnByte_IsText()
+    {
+        Assert.True(Utf16LeTextCodec.LooksLikeText([0x0D]));
+        Assert.Equal("\r", Utf16LeTextCodec.Decode([0x0D]));
+    }
+
+    [Fact]
+    public void PanDeCenteno_RemainsText()
+    {
+        var kind = Classify("notas", "dbLongBinary", [Utf16("PAN DE CENTENO")]);
+        Assert.Equal(LegacyBinaryColumnKind.Utf16Text, kind);
+    }
+
+    [Fact]
+    public void AccentsJamónPatéEspaña_AreText()
+    {
+        var kind = Classify(
+            "notas",
+            "dbLongBinary",
+            [Utf16("jamón"), Utf16("paté"), Utf16("España")]);
+        Assert.Equal(LegacyBinaryColumnKind.Utf16Text, kind);
+    }
+
+    [Fact]
+    public void RandomOddBytes_StayBinary()
+    {
+        var kind = Classify(
+            "payload",
+            "dbLongBinary",
+            [Convert.ToBase64String([0x01, 0x93, 0xFF, 0x72, 0xA6])]);
         Assert.Equal(LegacyBinaryColumnKind.Binary, kind);
+        Assert.False(Utf16LeTextCodec.LooksLikeText([0x01, 0x93, 0xFF, 0x72, 0xA6]));
+    }
+
+    [Fact]
+    public void RealArticulosCsv_ComposicioIsUtf16TextAndFotoIsBinary()
+    {
+        var directory = @"C:\Users\Usuario\Desktop\Compartir\bds";
+        var txt = Path.Combine(directory, "articulos.txt");
+        var csv = Path.Combine(directory, "articulos.csv");
+        if (!File.Exists(txt) || !File.Exists(csv))
+        {
+            return;
+        }
+
+        var schema = new TPVOne.LegacyAccess.Core.Parsing.TxtTableStructureParser()
+            .Parse(File.ReadAllText(txt));
+        var data = new TPVOne.LegacyAccess.Core.Sources.CsvLegacyDataSource(csv);
+        var kinds = _classifier.Classify(schema, data);
+
+        Assert.Equal(LegacyBinaryColumnKind.Utf16Text, kinds["COMPOSICIO"]);
+        Assert.Equal(LegacyBinaryColumnKind.Binary, kinds["FOTO"]);
+        Assert.Equal(
+            "nvarchar(max)",
+            new TPVOne.LegacyAccess.Core.Mapping.DaoToSqlTypeMapper()
+                .Map(EffectiveLegacySchema.Apply(schema, kinds).Columns
+                    .Single(column => column.Name.Equals("COMPOSICIO", StringComparison.OrdinalIgnoreCase)))
+                .ToSql());
+    }
+
+    [Fact]
+    public void RealComposicioMix_IsText()
+    {
+        var values = new[]
+        {
+            "IA==",
+            "SQBuAGcAcgBlAGQAaQ==",
+            Utf16("PAN DE CENTENO ALEMAN"),
+            Convert.ToBase64String([0x41, 0x00, 0x42])
+        };
+        var kind = Classify("COMPOSICIO", "dbLongBinary", values);
+        Assert.Equal(LegacyBinaryColumnKind.Utf16Text, kind);
     }
 
     [Fact]
