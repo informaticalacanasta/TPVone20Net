@@ -22,7 +22,9 @@ public static class AccessObjectFilter
 
 public static class LegacyFileScanner
 {
-    public static IReadOnlyList<string> FindMdbFiles(string sourceDirectory)
+    public static IReadOnlyList<string> FindMdbFiles(
+        string sourceDirectory,
+        SearchOption searchOption = SearchOption.AllDirectories)
     {
         if (!Directory.Exists(sourceDirectory))
         {
@@ -31,8 +33,9 @@ public static class LegacyFileScanner
         }
 
         return Directory
-            .EnumerateFiles(sourceDirectory, "*.mdb", SearchOption.TopDirectoryOnly)
-            .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+            .EnumerateFiles(sourceDirectory, "*.mdb", searchOption)
+            .Where(path => !path.EndsWith(".converting", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(path => Path.GetRelativePath(sourceDirectory, path), StringComparer.OrdinalIgnoreCase)
             .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
@@ -53,13 +56,5 @@ public static class FileHashCalculator
             FileOptions.Asynchronous | FileOptions.SequentialScan);
         var hash = await SHA256.HashDataAsync(stream, cancellationToken);
         return Convert.ToHexString(hash);
-    }
-}
-
-public static class ImportDeduplicationPolicy
-{
-    public static bool ShouldSkip(bool previousSuccessfulImport, bool forceImport)
-    {
-        return previousSuccessfulImport && !forceImport;
     }
 }

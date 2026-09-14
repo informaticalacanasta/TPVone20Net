@@ -1,14 +1,19 @@
 using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
 using TPVOne.LegacyAccess.Core.Models;
 
 namespace TPVOne.LegacyAccess;
 
 internal sealed class LegacyImporterProcess
 {
-    public async Task<int> RunAsync(
+    public const string ResultPrefix = "TPVONE_RESULT_JSON:";
+
+    public async Task<PipelineResult> RunAsync(
         string mode,
         LegacyAccessImportOptions options,
-        string? sqlConnectionString,
+        string sqlConnectionString,
+        string? decisionsFile = null,
         CancellationToken cancellationToken = default)
     {
         var executable = Path.Combine(
@@ -33,47 +38,118 @@ internal sealed class LegacyImporterProcess
         startInfo.ArgumentList.Add(mode);
         startInfo.ArgumentList.Add("--source");
         startInfo.ArgumentList.Add(options.SourceDirectory);
+        startInfo.ArgumentList.Add("--converted");
+        startInfo.ArgumentList.Add(options.ConvertedDirectory);
         startInfo.ArgumentList.Add("--batch-size");
         startInfo.ArgumentList.Add(options.BatchSize.ToString());
         startInfo.ArgumentList.Add("--timeout");
         startInfo.ArgumentList.Add(options.CommandTimeoutSeconds.ToString());
-        startInfo.ArgumentList.Add("--force");
-        startInfo.ArgumentList.Add(options.ForceImport.ToString());
-
-        if (sqlConnectionString is not null)
+        if (!string.IsNullOrWhiteSpace(decisionsFile))
         {
-            startInfo.Environment["TPVONE_SQL_CONNECTION"] = sqlConnectionString;
+            startInfo.ArgumentList.Add("--decisions");
+            startInfo.ArgumentList.Add(decisionsFile);
         }
+
+        startInfo.Environment["TPVONE_SQL_CONNECTION"] = sqlConnectionString;
 
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException(
                 "No se pudo iniciar el importador Access x86.");
-        var standardOutput = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var standardError = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken);
 
-        var output = await standardOutput;
-        var error = await standardError;
-        if (!string.IsNullOrWhiteSpace(output))
-        {
-            foreach (var line in output.Split(
-                         Environment.NewLine,
-                         StringSplitOptions.RemoveEmptyEntries))
+        string? resultJson = null;
+        var stdoutTask = PumpAsync(
+            process.StandardOutput,
+            line =>
             {
-                if (!line.StartsWith(
-                        "TPVONE_RESULT_JSON:",
-                        StringComparison.Ordinal))
+                if (line.StartsWith(ResultPrefix, StringComparison.Ordinal))
                 {
-                    Console.Out.WriteLine(line);
+                    resultJson = line[ResultPrefix.Length..];
+                    return;
                 }
-            }
-        }
 
-        if (!string.IsNullOrWhiteSpace(error))
+                Console.Out.WriteLine(line);
+            },
+            cancellationToken);
+        var stderrTask = PumpAsync(
+            process.StandardError,
+            Console.Error.WriteLine,
+            cancellationToken);
+
+        await process.WaitForExitAsync(cancellationToken);
+        await Task.WhenAll(stdoutTask, stderrTask);
+
+        PipelineResult? result = null;
+        if (!string.IsNullOrWhiteSpace(resultJson))
         {
-            Console.Error.Write(error);
+            result = JsonSerializer.Deserialize<PipelineResult>(
+                resultJson,
+                PipelineJson.Options);
         }
 
-        return process.ExitCode;
+        if (process.ExitCode != 0 && process.ExitCode != 2)
+        {
+            throw new InvalidOperationException(
+                $"El importador Access x86 finalizó con código {process.ExitCode}.");
+        }
+
+        return result ?? new PipelineResult(
+            mode,
+            null,
+            [],
+            [],
+            [],
+            [],
+            ["El importador no devolvió un resultado JSON."]);
+    }
+
+    private static async Task PumpAsync(
+        StreamReader reader,
+        Action<string> write,
+        CancellationToken cancellationToken)
+    {
+        var builder = new StringBuilder();
+        var buffer = new char[1024];
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
+            if (read == 0)
+            {
+                FlushLine(builder, write, final: true);
+                return;
+            }
+
+            builder.Append(buffer.AsSpan(0, read));
+            FlushLine(builder, write, final: false);
+        }
+    }
+
+    private static void FlushLine(StringBuilder builder, Action<string> write, bool final)
+    {
+        while (true)
+        {
+            var text = builder.ToString();
+            var index = text.IndexOfAny(['\r', '\n']);
+            if (index < 0)
+            {
+                if (final && text.Length > 0)
+                {
+                    write(text);
+                    builder.Clear();
+                }
+
+                return;
+            }
+
+            write(text[..index]);
+            var skip = 1;
+            if (text[index] == '\r' &&
+                index + 1 < text.Length &&
+                text[index + 1] == '\n')
+            {
+                skip = 2;
+            }
+
+            builder.Remove(0, index + skip);
+        }
     }
 }

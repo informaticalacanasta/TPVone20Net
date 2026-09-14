@@ -7,7 +7,8 @@ public sealed record AccessDatabaseSchema(
     string SourceHash,
     string Provider,
     IReadOnlyList<AccessTableSchema> Tables,
-    IReadOnlyList<string> Warnings);
+    IReadOnlyList<string> Warnings,
+    string? OriginalFilePath = null);
 
 public sealed record AccessTableSchema(
     string Name,

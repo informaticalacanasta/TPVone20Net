@@ -1,7 +1,9 @@
 using System.Data.OleDb;
 using System.Text;
+using TPVOne.LegacyAccess.Core.Conversion;
 using TPVOne.LegacyAccess.Core.Models;
 using TPVOne.LegacyAccess.Core.Schema;
+using TPVOne.LegacyAccess.Core.Planning;
 using TPVOne.LegacyAccess.Core.Utilities;
 
 namespace TPVOne.Tests;
@@ -41,6 +43,19 @@ public sealed class LegacyAccessCoreTests
     public void AccessObjectFilter_ExcludesSystemTables(string name, bool expected)
     {
         Assert.Equal(expected, AccessObjectFilter.IsUserTable(name));
+    }
+
+    [Theory]
+    [InlineData("MSysAccessObjects", true)]
+    [InlineData("MSysAccessStorage", true)]
+    [InlineData("MSysObjects", false)]
+    public void AccessFormatDetector_DetectsAccessApplicationCatalog(
+        string catalogTable,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            AccessFormatDetector.HasAccessApplicationCatalog(["usuarios", catalogTable]));
     }
 
     [Fact]
@@ -85,17 +100,15 @@ public sealed class LegacyAccessCoreTests
     }
 
     [Theory]
-    [InlineData(true, false, true)]
-    [InlineData(true, true, false)]
-    [InlineData(false, false, false)]
-    public void Deduplication_OnlySkipsSuccessfulHashWithoutForce(
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    public void Deduplication_OnlySkipsSuccessfulHash(
         bool previousSuccess,
-        bool force,
         bool expected)
     {
         Assert.Equal(
             expected,
-            ImportDeduplicationPolicy.ShouldSkip(previousSuccess, force));
+            ImportDeduplicationPolicy.ShouldSkipAlreadyImported(previousSuccess));
     }
 
     [Fact]

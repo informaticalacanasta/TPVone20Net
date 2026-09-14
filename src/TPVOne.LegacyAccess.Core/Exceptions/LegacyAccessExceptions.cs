@@ -71,3 +71,11 @@ public sealed class DataImportException : LegacyAccessException
     {
     }
 }
+
+public sealed class AccessConversionException : LegacyAccessException
+{
+    public AccessConversionException(string message, Exception? inner = null)
+        : base(message, inner)
+    {
+    }
+}

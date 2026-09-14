@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.OleDb;
+using TPVOne.LegacyAccess.Core.Conversion;
 using TPVOne.LegacyAccess.Core.Exceptions;
 using TPVOne.LegacyAccess.Core.Models;
 using TPVOne.LegacyAccess.Core.Utilities;
@@ -59,6 +60,36 @@ public sealed class AccessDatabaseReader
         }
     }
 
+    public IReadOnlyList<string> ListUserTableNames(string filePath, string? password = null)
+    {
+        var selection = _providerDetector.Detect(filePath, password);
+        using var connection = new OleDbConnection(selection.ConnectionString);
+        connection.Open();
+        return ReadUserTableNames(connection);
+    }
+
+    public IReadOnlyList<string> ListAllTableNames(string filePath, string? password = null)
+    {
+        var selection = _providerDetector.Detect(filePath, password);
+        using var connection = new OleDbConnection(selection.ConnectionString);
+        connection.Open();
+        return ReadAllTableNames(connection);
+    }
+
+    public bool HasAccessApplicationCatalog(string filePath, string? password = null)
+    {
+        var selection = _providerDetector.Detect(filePath, password);
+        using var connection = new OleDbConnection(selection.ConnectionString);
+        connection.Open();
+        if (AccessFormatDetector.HasAccessApplicationCatalog(ReadAllTableNames(connection)))
+        {
+            return true;
+        }
+
+        return CanOpenTable(connection, "MSysAccessObjects") ||
+            CanOpenTable(connection, "MSysAccessStorage");
+    }
+
     public OleDbConnection OpenConnection(
         string filePath,
         string provider,
@@ -84,9 +115,26 @@ public sealed class AccessDatabaseReader
 
     private static IReadOnlyList<string> ReadUserTableNames(OleDbConnection connection)
     {
-        var schema = connection.GetOleDbSchemaTable(
-            OleDbSchemaGuid.Tables,
-            [null, null, null, "TABLE"]);
+        return ReadNamedTables(connection)
+            .Where(table => AccessObjectFilter.IsUserTable(table.Name, table.Type))
+            .Select(table => table.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<string> ReadAllTableNames(OleDbConnection connection)
+    {
+        return ReadNamedTables(connection)
+            .Select(table => table.Name)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<(string Name, string? Type)> ReadNamedTables(OleDbConnection connection)
+    {
+        var schema = connection.GetOleDbSchemaTable(OleDbSchemaGuid.Tables, null);
         if (schema is null)
         {
             return [];
@@ -94,16 +142,26 @@ public sealed class AccessDatabaseReader
 
         return schema.Rows
             .Cast<DataRow>()
-            .Select(row => new
-            {
-                Name = Convert.ToString(row["TABLE_NAME"]) ?? string.Empty,
-                Type = Convert.ToString(row["TABLE_TYPE"])
-            })
-            .Where(table => AccessObjectFilter.IsUserTable(table.Name, table.Type))
-            .Select(table => table.Name)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .Select(row => (
+                Name: Convert.ToString(row["TABLE_NAME"]) ?? string.Empty,
+                Type: Convert.ToString(row["TABLE_TYPE"])))
             .ToArray();
+    }
+
+    private static bool CanOpenTable(OleDbConnection connection, string tableName)
+    {
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                $"SELECT COUNT(*) FROM {SqlIdentifier.Quote(tableName)} WHERE 1 = 0";
+            command.ExecuteScalar();
+            return true;
+        }
+        catch (OleDbException)
+        {
+            return false;
+        }
     }
 
     private static AccessTableSchema ReadTableSchema(

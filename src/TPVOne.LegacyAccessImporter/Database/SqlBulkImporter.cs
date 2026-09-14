@@ -25,9 +25,10 @@ internal sealed class SqlBulkImporter
         _options = options;
     }
 
-    public async Task<long> ImportAsync(
+    public async Task<long> ImportIntoAsync(
         AccessDatabaseSchema database,
         AccessTableSchema table,
+        string destinationTableName,
         CancellationToken cancellationToken)
     {
         using var accessConnection = _accessReader.OpenConnection(
@@ -47,8 +48,15 @@ internal sealed class SqlBulkImporter
             var before = await _schemaService.CountRowsAsync(
                 sqlConnection,
                 transaction,
-                table.Name,
+                destinationTableName,
                 cancellationToken);
+            if (before != 0)
+            {
+                throw new DataImportException(
+                    $"La tabla destino '{destinationTableName}' no está vacía. " +
+                    "No se permite un SqlBulkCopy que duplique filas.");
+            }
+
             var options = table.Columns.Any(column => column.IsAutoIncrement)
                 ? SqlBulkCopyOptions.KeepIdentity
                 : SqlBulkCopyOptions.Default;
@@ -59,7 +67,7 @@ internal sealed class SqlBulkImporter
                 transaction)
             {
                 DestinationTableName =
-                    $"dbo.{SqlIdentifier.Quote(table.Name)}",
+                    $"dbo.{SqlIdentifier.Quote(destinationTableName)}",
                 BatchSize = _options.BatchSize,
                 BulkCopyTimeout = _options.CommandTimeoutSeconds,
                 EnableStreaming = true
@@ -71,27 +79,21 @@ internal sealed class SqlBulkImporter
             }
 
             await bulkCopy.WriteToServerAsync(accessDataReader, cancellationToken);
-            await _schemaService.CreateIndexesAsync(
-                sqlConnection,
-                transaction,
-                table,
-                cancellationToken);
 
             var after = await _schemaService.CountRowsAsync(
                 sqlConnection,
                 transaction,
-                table.Name,
+                destinationTableName,
                 cancellationToken);
-            var imported = after - before;
-            if (imported != table.RowCount)
+            if (after != table.RowCount)
             {
                 throw new DataImportException(
                     $"La validación de filas falló para '{table.Name}': " +
-                    $"origen={table.RowCount}, diferencia SQL={imported}.");
+                    $"origen={table.RowCount}, destino={after}.");
             }
 
             await transaction.CommitAsync(cancellationToken);
-            return imported;
+            return after;
         }
         catch (Exception exception)
         {
@@ -99,8 +101,8 @@ internal sealed class SqlBulkImporter
             throw exception is DataImportException
                 ? exception
                 : new DataImportException(
-                    $"SqlBulkCopy falló para '{database.FilePath}', " +
-                    $"tabla '{table.Name}'.",
+                    $"SqlBulkCopy falló. Archivo: {database.FilePath}; " +
+                    $"Tabla: {table.Name}; Mensaje: {exception.Message}",
                     exception);
         }
     }
