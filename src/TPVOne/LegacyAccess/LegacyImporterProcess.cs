@@ -11,19 +11,18 @@ internal sealed class LegacyImporterProcess
 
     public async Task<PipelineResult> RunAsync(
         string mode,
-        LegacyAccessImportOptions options,
+        LegacyImportOptions options,
         string sqlConnectionString,
-        string? decisionsFile = null,
         CancellationToken cancellationToken = default)
     {
         var executable = Path.Combine(
             AppContext.BaseDirectory,
-            "LegacyAccessImporter",
+            "LegacyImporter",
             "TPVOne.LegacyAccessImporter.exe");
         if (!File.Exists(executable))
         {
             throw new FileNotFoundException(
-                "No se encontró el importador Access x86. Compile la solución completa.",
+                "No se encontró el importador legacy. Compile la solución completa.",
                 executable);
         }
 
@@ -38,23 +37,24 @@ internal sealed class LegacyImporterProcess
         startInfo.ArgumentList.Add(mode);
         startInfo.ArgumentList.Add("--source");
         startInfo.ArgumentList.Add(options.SourceDirectory);
-        startInfo.ArgumentList.Add("--converted");
-        startInfo.ArgumentList.Add(options.ConvertedDirectory);
         startInfo.ArgumentList.Add("--batch-size");
         startInfo.ArgumentList.Add(options.BatchSize.ToString());
         startInfo.ArgumentList.Add("--timeout");
         startInfo.ArgumentList.Add(options.CommandTimeoutSeconds.ToString());
-        if (!string.IsNullOrWhiteSpace(decisionsFile))
+        startInfo.ArgumentList.Add("--encoding");
+        startInfo.ArgumentList.Add(options.DefaultEncoding);
+        startInfo.ArgumentList.Add("--delimiter");
+        startInfo.ArgumentList.Add(options.Delimiter);
+        if (options.ForceImport)
         {
-            startInfo.ArgumentList.Add("--decisions");
-            startInfo.ArgumentList.Add(decisionsFile);
+            startInfo.ArgumentList.Add("--force");
         }
 
         startInfo.Environment["TPVONE_SQL_CONNECTION"] = sqlConnectionString;
 
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException(
-                "No se pudo iniciar el importador Access x86.");
+                "No se pudo iniciar el importador legacy.");
 
         string? resultJson = null;
         var stdoutTask = PumpAsync(
@@ -89,12 +89,12 @@ internal sealed class LegacyImporterProcess
         if (process.ExitCode != 0 && process.ExitCode != 2)
         {
             throw new InvalidOperationException(
-                $"El importador Access x86 finalizó con código {process.ExitCode}.");
+                $"El importador legacy finalizó con código {process.ExitCode}.");
         }
 
         return result ?? new PipelineResult(
             mode,
-            null,
+            [],
             [],
             [],
             [],

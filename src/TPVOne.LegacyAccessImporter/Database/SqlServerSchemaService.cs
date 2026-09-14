@@ -1,23 +1,25 @@
 using Microsoft.Data.SqlClient;
+using TPVOne.LegacyAccess.Core.Import;
+using TPVOne.LegacyAccess.Core.Mapping;
 using TPVOne.LegacyAccess.Core.Models;
 using TPVOne.LegacyAccess.Core.Schema;
 using TPVOne.LegacyAccess.Core.Utilities;
 
 namespace TPVOne.LegacyAccessImporter.Database;
 
-internal sealed class SqlServerSchemaService
+internal sealed class SqlServerSchemaService : ILegacySqlSchemaPort
 {
     private readonly string _connectionString;
-    private readonly AccessToSqlTypeMapper _typeMapper;
+    private readonly LegacySqlDdlBuilder _ddlBuilder;
     private readonly int _commandTimeout;
 
     public SqlServerSchemaService(
         string connectionString,
-        AccessToSqlTypeMapper typeMapper,
+        DaoToSqlTypeMapper typeMapper,
         int commandTimeout)
     {
         _connectionString = connectionString;
-        _typeMapper = typeMapper;
+        _ddlBuilder = new LegacySqlDdlBuilder(typeMapper);
         _commandTimeout = commandTimeout;
     }
 
@@ -41,18 +43,18 @@ internal sealed class SqlServerSchemaService
     }
 
     public Task CreateTableAsync(
-        AccessTableSchema table,
+        LegacyTableSchema table,
         CancellationToken cancellationToken)
     {
         return CreateTableAsync(table, table.Name, cancellationToken);
     }
 
     public async Task CreateTableAsync(
-        AccessTableSchema table,
+        LegacyTableSchema table,
         string destinationTableName,
         CancellationToken cancellationToken)
     {
-        var sql = BuildCreateTableSql(table, destinationTableName);
+        var sql = _ddlBuilder.BuildCreateTableSql(table, destinationTableName);
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var transaction =
@@ -65,20 +67,9 @@ internal sealed class SqlServerSchemaService
         await transaction.CommitAsync(cancellationToken);
     }
 
-    public string BuildCreateTableSql(AccessTableSchema table, string destinationTableName)
+    public string BuildCreateTableSql(LegacyTableSchema table, string destinationTableName)
     {
-        var columnDefinitions = table.Columns
-            .OrderBy(column => column.Ordinal)
-            .Select(column =>
-            {
-                var identity = column.IsAutoIncrement ? " IDENTITY(1,1)" : string.Empty;
-                var nullability = column.IsNullable ? " NULL" : " NOT NULL";
-                return $"    {SqlIdentifier.Quote(column.Name)} " +
-                    $"{_typeMapper.Map(column).ToSql()}{identity}{nullability}";
-            });
-        return $"CREATE TABLE dbo.{SqlIdentifier.Quote(destinationTableName)}{Environment.NewLine}" +
-            $"({Environment.NewLine}{string.Join($",{Environment.NewLine}", columnDefinitions)}" +
-            $"{Environment.NewLine});";
+        return _ddlBuilder.BuildCreateTableSql(table, destinationTableName);
     }
 
     public async Task<long> CountRowsAsync(
@@ -88,42 +79,6 @@ internal sealed class SqlServerSchemaService
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
         return await CountRowsAsync(connection, transaction: null, tableName, cancellationToken);
-    }
-
-    public async Task RenameTableAsync(
-        string fromName,
-        string toName,
-        CancellationToken cancellationToken)
-    {
-        await using var connection = new SqlConnection(_connectionString);
-        await connection.OpenAsync(cancellationToken);
-        await using var command = new SqlCommand(
-            "EXEC sp_rename @From, @To;",
-            connection)
-        {
-            CommandTimeout = _commandTimeout
-        };
-        command.Parameters.AddWithValue("@From", $"dbo.{fromName}");
-        command.Parameters.AddWithValue("@To", toName);
-        await command.ExecuteNonQueryAsync(cancellationToken);
-    }
-
-    public async Task DropTableIfExistsAsync(
-        string tableName,
-        CancellationToken cancellationToken)
-    {
-        var quoted = SqlIdentifier.Quote(tableName);
-        var sql = $"""
-            IF OBJECT_ID(N'dbo.{quoted}', N'U') IS NOT NULL
-                DROP TABLE dbo.{quoted};
-            """;
-        await using var connection = new SqlConnection(_connectionString);
-        await connection.OpenAsync(cancellationToken);
-        await using var command = new SqlCommand(sql, connection)
-        {
-            CommandTimeout = _commandTimeout
-        };
-        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<SqlTableSchema> ReadTableSchemaAsync(
@@ -204,11 +159,11 @@ internal sealed class SqlServerSchemaService
 
         var indexes = indexRows
             .GroupBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(group => new AccessIndexSchema(
+            .Select(group => new LegacyIndexSchema(
                 group.Key,
                 group.First().IsUnique,
                 group.First().IsPrimary,
-                group.Select(row => new AccessIndexColumn(
+                group.Select(row => new LegacyIndexColumn(
                         row.ColumnName,
                         row.Ordinal,
                         row.IsDescending))
@@ -220,74 +175,46 @@ internal sealed class SqlServerSchemaService
     }
 
     public async Task CreateIndexesAsync(
+        LegacyTableSchema table,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await CreateIndexesAsync(
+            connection,
+            transaction: null,
+            table,
+            table.Name,
+            cancellationToken);
+    }
+
+    public async Task CreateIndexesAsync(
         SqlConnection connection,
         SqlTransaction? transaction,
-        AccessTableSchema table,
+        LegacyTableSchema table,
         string destinationTableName,
         CancellationToken cancellationToken)
     {
-        foreach (var index in table.Indexes)
+        var statements = _ddlBuilder.BuildCreateIndexSql(table, destinationTableName);
+        for (var index = 0; index < table.Indexes.Count; index++)
         {
+            var current = table.Indexes[index];
             if (await IndexExistsAsync(
                     connection,
                     transaction,
                     destinationTableName,
-                    index.Name,
+                    current.Name,
                     cancellationToken))
             {
                 continue;
             }
 
-            var columns = string.Join(
-                ", ",
-                index.Columns
-                    .OrderBy(column => column.Ordinal)
-                    .Select(column =>
-                        $"{SqlIdentifier.Quote(column.Name)}" +
-                        (column.IsDescending ? " DESC" : " ASC")));
-            string sql;
-            if (index.IsPrimaryKey)
-            {
-                sql = $"ALTER TABLE dbo.{SqlIdentifier.Quote(destinationTableName)} " +
-                      $"ADD CONSTRAINT {SqlIdentifier.Quote(index.Name)} PRIMARY KEY ({columns});";
-            }
-            else
-            {
-                var unique = index.IsUnique ? "UNIQUE " : string.Empty;
-                var filter = index.IsUnique
-                    ? BuildUniqueNullFilter(table, index)
-                    : null;
-                sql = $"CREATE {unique}INDEX {SqlIdentifier.Quote(index.Name)} ON " +
-                      $"dbo.{SqlIdentifier.Quote(destinationTableName)} ({columns})" +
-                      $"{filter};";
-            }
-
             await using var command = transaction is null
-                ? new SqlCommand(sql, connection)
-                : new SqlCommand(sql, connection, transaction);
+                ? new SqlCommand(statements[index], connection)
+                : new SqlCommand(statements[index], connection, transaction);
             command.CommandTimeout = _commandTimeout;
             await command.ExecuteNonQueryAsync(cancellationToken);
         }
-    }
-
-    private static string? BuildUniqueNullFilter(
-        AccessTableSchema table,
-        AccessIndexSchema index)
-    {
-        var nullableColumns = index.Columns
-            .Where(indexColumn => table.Columns.Any(column =>
-                string.Equals(column.Name, indexColumn.Name, StringComparison.OrdinalIgnoreCase) &&
-                column.IsNullable))
-            .Select(indexColumn => SqlIdentifier.Quote(indexColumn.Name))
-            .ToArray();
-        if (nullableColumns.Length == 0)
-        {
-            return null;
-        }
-
-        return " WHERE " + string.Join(
-            " AND ",
-            nullableColumns.Select(column => $"{column} IS NOT NULL"));
     }
 
     public async Task<long> CountRowsAsync(

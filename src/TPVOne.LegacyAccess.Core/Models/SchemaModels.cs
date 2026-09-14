@@ -1,40 +1,28 @@
-using System.Data.OleDb;
-
 namespace TPVOne.LegacyAccess.Core.Models;
 
-public sealed record AccessDatabaseSchema(
-    string FilePath,
-    string SourceHash,
-    string Provider,
-    IReadOnlyList<AccessTableSchema> Tables,
-    IReadOnlyList<string> Warnings,
-    string? OriginalFilePath = null);
-
-public sealed record AccessTableSchema(
+public sealed record LegacyTableSchema(
     string Name,
-    IReadOnlyList<AccessColumnSchema> Columns,
-    IReadOnlyList<AccessIndexSchema> Indexes,
-    long RowCount);
+    IReadOnlyList<LegacyColumnSchema> Columns,
+    IReadOnlyList<LegacyIndexSchema> Indexes,
+    long RowCount = 0);
 
-public sealed record AccessColumnSchema(
+public sealed record LegacyColumnSchema(
     string Name,
-    OleDbType ProviderType,
-    string ClrTypeName,
-    int? MaxLength,
+    string SourceTypeName,
+    int? Size,
     byte? Precision,
     byte? Scale,
-    bool IsNullable,
-    bool IsAutoIncrement,
     int Ordinal,
-    string? DefaultValue);
+    bool IsNullable,
+    bool IsAutoIncrement);
 
-public sealed record AccessIndexSchema(
+public sealed record LegacyIndexSchema(
     string Name,
     bool IsUnique,
     bool IsPrimaryKey,
-    IReadOnlyList<AccessIndexColumn> Columns);
+    IReadOnlyList<LegacyIndexColumn> Columns);
 
-public sealed record AccessIndexColumn(
+public sealed record LegacyIndexColumn(
     string Name,
     int Ordinal,
     bool IsDescending);
@@ -86,4 +74,4 @@ public sealed record SqlColumnSchema(
 public sealed record SqlTableSchema(
     string Name,
     IReadOnlyList<SqlColumnSchema> Columns,
-    IReadOnlyList<AccessIndexSchema> Indexes);
+    IReadOnlyList<LegacyIndexSchema> Indexes);

@@ -7,16 +7,14 @@ public interface IReplacementOperations
 {
     Task CreateEmptyTableAsync(
         string tableName,
-        AccessTableSchema schema,
+        LegacyTableSchema schema,
         CancellationToken cancellationToken);
 
-    Task<long> CopyDataAsync(
-        string tableName,
-        CancellationToken cancellationToken);
+    Task<long> CopyDataAsync(string tableName, CancellationToken cancellationToken);
 
     Task CreateIndexesAsync(
         string tableName,
-        AccessTableSchema schema,
+        LegacyTableSchema schema,
         CancellationToken cancellationToken);
 
     Task<long> CountAsync(string tableName, CancellationToken cancellationToken);
@@ -36,7 +34,7 @@ public sealed class SafeReplacementWorkflow
 {
     public async Task<long> ReplaceOrCreateAsync(
         IReplacementOperations operations,
-        AccessTableSchema schema,
+        LegacyTableSchema schema,
         string destinationTableName,
         string stagingTableName,
         string backupTableName,

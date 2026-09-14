@@ -29,12 +29,18 @@
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
 
-  <Target Name="CopyLegacyAccessImporter" AfterTargets="Build">
+  <Target Name="CopyLegacyImporter" AfterTargets="Build">
     <ItemGroup>
-      <LegacyImporterFiles Include="$(MSBuildThisFileDirectory)..\TPVOne.LegacyAccessImporter\bin\$(Configuration)\net10.0-windows\win-x86\**\*.*" />
+      <LegacyImporterFiles Include="$(MSBuildThisFileDirectory)..\TPVOne.LegacyAccessImporter\bin\$(Configuration)\net10.0-windows\win-x64\**\*.*" />
     </ItemGroup>
     <Copy SourceFiles="@(LegacyImporterFiles)"
-          DestinationFiles="@(LegacyImporterFiles->'$(OutDir)LegacyAccessImporter\%(RecursiveDir)%(Filename)%(Extension)')" />
+          DestinationFiles="@(LegacyImporterFiles->'$(OutDir)LegacyImporter\%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+
+  <Target Name="PublishLegacyImporter" AfterTargets="Publish">
+    <MSBuild Projects="$(MSBuildThisFileDirectory)..\TPVOne.LegacyAccessImporter\TPVOne.LegacyAccessImporter.csproj"
+             Targets="Publish"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=$(SelfContained);TargetFramework=$(TargetFramework);PublishDir=$(PublishDir)LegacyImporter\" />
   </Target>
 
 </Project>

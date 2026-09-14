@@ -7,7 +7,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Data.OleDb" Version="10.0.12" />
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.12">
+      <NoWarn>NU1510</NoWarn>
+    </PackageReference>
   </ItemGroup>
 
 </Project>

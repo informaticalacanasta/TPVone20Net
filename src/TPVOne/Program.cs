@@ -1,5 +1,4 @@
-﻿using System.Text.Json;
-using Microsoft.Extensions.Configuration;
+﻿using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using TPVOne.Database;
@@ -38,17 +37,20 @@ internal static class Program
 
         try
         {
-            var accessCommand = ParseAccessCommand(args);
+            var command = ParseCommand(args);
             var importOptions = configuration
-                .GetSection("LegacyAccessImport")
-                .Get<LegacyAccessImportOptions>()
-                ?? new LegacyAccessImportOptions();
-            if (accessCommand.SourceDirectory is not null)
+                .GetSection("LegacyImport")
+                .Get<LegacyImportOptions>()
+                ?? configuration
+                    .GetSection("LegacyAccessImport")
+                    .Get<LegacyImportOptions>()
+                ?? new LegacyImportOptions();
+            if (command.SourceDirectory is not null)
             {
-                importOptions.SourceDirectory = accessCommand.SourceDirectory;
+                importOptions.SourceDirectory = command.SourceDirectory;
             }
 
-            if (accessCommand.Mode is null)
+            if (command.Mode is null)
             {
                 var installerOnly = serviceProvider.GetRequiredService<DatabaseInstaller>();
                 await installerOnly.EnsureDatabaseExistsAsync();
@@ -59,11 +61,10 @@ internal static class Program
                 return 0;
             }
 
-            if (string.IsNullOrWhiteSpace(importOptions.SourceDirectory) ||
-                string.IsNullOrWhiteSpace(importOptions.ConvertedDirectory))
+            if (string.IsNullOrWhiteSpace(importOptions.SourceDirectory))
             {
                 throw new InvalidOperationException(
-                    "Configure LegacyAccessImport:SourceDirectory y ConvertedDirectory.");
+                    "Configure LegacyImport:SourceDirectory o use --source.");
             }
 
             var installer = serviceProvider.GetRequiredService<DatabaseInstaller>();
@@ -74,141 +75,64 @@ internal static class Program
 
             var importer = serviceProvider.GetRequiredService<LegacyImporterProcess>();
             var connection = installer.GetApplicationConnectionString();
-
-            if (accessCommand.Mode is "analyze" or "plan" or "convert")
-            {
-                var result = await importer.RunAsync(
-                    accessCommand.Mode,
-                    importOptions,
-                    connection);
-                return result.IsSuccessful ? 0 : 2;
-            }
-
-            var plan = await importer.RunAsync("plan", importOptions, connection);
-            var pending = plan.Plan
-                .Where(item => item.Status == PlannedTableStatus.RequiresDecision)
-                .ToArray();
-            var decisions = new List<TableDecision>();
-            foreach (var item in pending)
-            {
-                var action = PromptDecision(item);
-                if (action == ExistingTableAction.Cancel)
-                {
-                    Console.WriteLine("Importación cancelada. No se ejecutará el lote.");
-                    return 2;
-                }
-
-                decisions.Add(new(item.SourceHash, item.TableName, action));
-            }
-
-            string? decisionsFile = null;
-            if (decisions.Count > 0)
-            {
-                decisionsFile = Path.Combine(
-                    Path.GetTempPath(),
-                    $"tpvone-decisions-{Guid.NewGuid():N}.json");
-                await File.WriteAllTextAsync(
-                    decisionsFile,
-                    JsonSerializer.Serialize(
-                        new DecisionFile { Items = decisions },
-                        PipelineJson.Options));
-            }
-
-            try
-            {
-                var imported = await importer.RunAsync(
-                    "import",
-                    importOptions,
-                    connection,
-                    decisionsFile);
-                return imported.IsSuccessful ? 0 : 2;
-            }
-            finally
-            {
-                if (decisionsFile is not null)
-                {
-                    File.Delete(decisionsFile);
-                }
-            }
+            var result = await importer.RunAsync(
+                command.Mode,
+                importOptions,
+                connection);
+            return result.IsSuccessful ? 0 : 2;
         }
         catch (Exception exception)
         {
             logger.LogCritical(
                 exception,
-                "No se pudo inicializar la base de datos. TPVOne finalizará.");
+                "No se pudo inicializar TPVOne.");
             return 1;
         }
     }
 
-    private static ExistingTableAction PromptDecision(PlannedTable item)
-    {
-        Console.WriteLine();
-        Console.WriteLine("==================================================");
-        Console.WriteLine("TABLA SQL YA EXISTENTE");
-        Console.WriteLine("==================================================");
-        Console.WriteLine();
-        Console.WriteLine("Archivo:");
-        Console.WriteLine(item.ConvertedFile);
-        Console.WriteLine();
-        Console.WriteLine("Tabla:");
-        Console.WriteLine(item.TableName);
-        Console.WriteLine();
-        Console.WriteLine("MDB nuevo:");
-        Console.WriteLine($"{item.SourceRowCount} registros");
-        Console.WriteLine();
-        Console.WriteLine("SQL Server actual:");
-        Console.WriteLine($"{item.SqlRowCount} registros");
-        Console.WriteLine();
-        Console.WriteLine("El origen es diferente al que se importó anteriormente.");
-        Console.WriteLine();
-        Console.WriteLine("¿Qué desea hacer?");
-        Console.WriteLine();
-        Console.WriteLine("[1] Omitir (solo esta tabla)");
-        Console.WriteLine("[2] Sustituir tabla completa");
-        Console.WriteLine("[3] Cancelar importación (lote completo)");
-
-        while (true)
-        {
-            Console.Write("> ");
-            var answer = Console.ReadLine()?.Trim();
-            switch (answer)
-            {
-                case "1":
-                    return ExistingTableAction.Skip;
-                case "2":
-                    return ExistingTableAction.Replace;
-                case "3":
-                    return ExistingTableAction.Cancel;
-            }
-
-            Console.WriteLine("Seleccione 1, 2 o 3.");
-        }
-    }
-
-    private static AccessCommand ParseAccessCommand(string[] args)
+    private static LegacyCommand ParseCommand(string[] args)
     {
         if (args.Length == 0)
         {
             return new(null, null);
         }
 
-        if (args.Length > 2 ||
-            args[0] is not ("--analyze-access" or "--import-access" or "--plan-access" or "--convert-access"))
+        string? mode = null;
+        string? source = null;
+        for (var index = 0; index < args.Length; index++)
         {
-            throw new ArgumentException(
-                "Uso: TPVOne [--analyze-access|--plan-access|--import-access|--convert-access] [carpeta]");
+            switch (args[index])
+            {
+                case "--analyze":
+                case "--analyze-access":
+                    mode = "analyze";
+                    break;
+                case "--import":
+                case "--import-access":
+                    mode = "import";
+                    break;
+                case "--source":
+                    if (++index >= args.Length)
+                    {
+                        throw new ArgumentException("Falta el valor para --source.");
+                    }
+
+                    source = args[index];
+                    break;
+                default:
+                    if (mode is not null && source is null && !args[index].StartsWith('-'))
+                    {
+                        source = args[index];
+                        break;
+                    }
+
+                    throw new ArgumentException(
+                        "Uso: TPVOne [--analyze|--import] [--source carpeta]");
+            }
         }
 
-        return new(
-            args[0] switch
-            {
-                "--analyze-access" => "analyze",
-                "--plan-access" => "plan",
-                "--convert-access" => "convert",
-                _ => "import"
-            },
-            args.Length == 2 ? args[1] : null);
+        return new(mode, source);
     }
 
-    private sealed record AccessCommand(string? Mode, string? SourceDirectory);
+    private sealed record LegacyCommand(string? Mode, string? SourceDirectory);
 }

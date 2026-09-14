@@ -1,42 +1,37 @@
 using Microsoft.Data.SqlClient;
-using TPVOne.LegacyAccess.Core.Access;
 using TPVOne.LegacyAccess.Core.Exceptions;
+using TPVOne.LegacyAccess.Core.Import;
 using TPVOne.LegacyAccess.Core.Models;
+using TPVOne.LegacyAccess.Core.Planning;
+using TPVOne.LegacyAccess.Core.Sources;
 using TPVOne.LegacyAccess.Core.Utilities;
 
 namespace TPVOne.LegacyAccessImporter.Database;
 
-internal sealed class SqlBulkImporter
+internal sealed class SqlBulkImporter : ILegacyDataCopyPort
 {
     private readonly string _connectionString;
-    private readonly AccessDatabaseReader _accessReader;
     private readonly SqlServerSchemaService _schemaService;
-    private readonly LegacyAccessImportOptions _options;
+    private readonly LegacyImportOptions _options;
 
     public SqlBulkImporter(
         string connectionString,
-        AccessDatabaseReader accessReader,
         SqlServerSchemaService schemaService,
-        LegacyAccessImportOptions options)
+        LegacyImportOptions options)
     {
         _connectionString = connectionString;
-        _accessReader = accessReader;
         _schemaService = schemaService;
         _options = options;
     }
 
-    public async Task<long> ImportIntoAsync(
-        AccessDatabaseSchema database,
-        AccessTableSchema table,
+    public async Task<long> CopyAsync(
+        LegacyTableSchema schema,
+        ILegacyDataSource dataSource,
         string destinationTableName,
+        long expectedRowCount,
         CancellationToken cancellationToken)
     {
-        using var accessConnection = _accessReader.OpenConnection(
-            database.FilePath,
-            database.Provider);
-        using var accessDataReader = _accessReader.OpenTableReader(
-            accessConnection,
-            table.Name);
+        using var dataReader = dataSource.OpenReader(schema);
 
         await using var sqlConnection = new SqlConnection(_connectionString);
         await sqlConnection.OpenAsync(cancellationToken);
@@ -57,7 +52,7 @@ internal sealed class SqlBulkImporter
                     "No se permite un SqlBulkCopy que duplique filas.");
             }
 
-            var options = table.Columns.Any(column => column.IsAutoIncrement)
+            var options = schema.Columns.Any(column => column.IsAutoIncrement)
                 ? SqlBulkCopyOptions.KeepIdentity
                 : SqlBulkCopyOptions.Default;
 
@@ -73,23 +68,23 @@ internal sealed class SqlBulkImporter
                 EnableStreaming = true
             };
 
-            foreach (var column in table.Columns)
+            foreach (var column in schema.Columns)
             {
                 bulkCopy.ColumnMappings.Add(column.Name, column.Name);
             }
 
-            await bulkCopy.WriteToServerAsync(accessDataReader, cancellationToken);
+            await bulkCopy.WriteToServerAsync(dataReader, cancellationToken);
 
             var after = await _schemaService.CountRowsAsync(
                 sqlConnection,
                 transaction,
                 destinationTableName,
                 cancellationToken);
-            if (after != table.RowCount)
+            if (!RowCountValidator.Matches(expectedRowCount, after))
             {
                 throw new DataImportException(
-                    $"La validación de filas falló para '{table.Name}': " +
-                    $"origen={table.RowCount}, destino={after}.");
+                    $"La validación de filas falló para '{schema.Name}': " +
+                    $"origen={expectedRowCount}, destino={after}.");
             }
 
             await transaction.CommitAsync(cancellationToken);
@@ -101,8 +96,8 @@ internal sealed class SqlBulkImporter
             throw exception is DataImportException
                 ? exception
                 : new DataImportException(
-                    $"SqlBulkCopy falló. Archivo: {database.FilePath}; " +
-                    $"Tabla: {table.Name}; Mensaje: {exception.Message}",
+                    $"SqlBulkCopy falló. Origen: {dataSource.Location}; " +
+                    $"Tabla: {schema.Name}; Mensaje: {exception.Message}",
                     exception);
         }
     }

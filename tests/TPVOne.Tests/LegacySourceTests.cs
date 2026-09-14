@@ -1,0 +1,612 @@
+using System.Text;
+using TPVOne.LegacyAccess.Core.Binary;
+using TPVOne.LegacyAccess.Core.Data;
+using TPVOne.LegacyAccess.Core.Exceptions;
+using TPVOne.LegacyAccess.Core.Import;
+using TPVOne.LegacyAccess.Core.Mapping;
+using TPVOne.LegacyAccess.Core.Models;
+using TPVOne.LegacyAccess.Core.Parsing;
+using TPVOne.LegacyAccess.Core.Planning;
+using TPVOne.LegacyAccess.Core.Schema;
+using TPVOne.LegacyAccess.Core.Sources;
+using TPVOne.LegacyAccess.Core.Utilities;
+
+namespace TPVOne.Tests;
+
+public sealed class LegacySourceTests
+{
+    private const string AlergenosTxt = """
+        Nombre Tabla=alergenos
+        Estructura:
+        Nombre Campo=id_alergeno Tipo=dbLong  Entero largo, size=4
+        Nombre Campo=DESCRIPCIO Tipo=dbText Texto, size=30
+        Nombre Campo=FOTO_activado Tipo=dbLongBinary    Objeto OLE / binario largo
+        Indices:
+        Nombre Indice: id_alergeno
+         Es Primary: False
+         Es Unique: True
+         Campos:
+            - id_alergeno
+        """;
+
+    private readonly TxtTableStructureParser _parser = new();
+    private readonly DaoToSqlTypeMapper _mapper = new();
+
+    [Fact]
+    public void Scanner_FindsTxtSchemaSources()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        File.WriteAllText(Path.Combine(directory.Path, "familias.txt"), TableTxt("familias"));
+
+        var result = Scan(directory.Path);
+
+        Assert.Equal(2, result.Sources.Count);
+        Assert.Equal(["alergenos", "familias"], result.Sources.Select(source => source.LogicalName));
+    }
+
+    [Fact]
+    public void Scanner_AllowsTxtWithoutCsv()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+
+        var result = Scan(directory.Path);
+
+        Assert.Single(result.Sources);
+        Assert.Null(result.Sources[0].DataSource);
+        Assert.Empty(result.OrphanDataFiles);
+        Assert.Empty(result.Errors);
+    }
+
+    [Fact]
+    public void Scanner_AssociatesCsvWhenPresent()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.csv"), "id_alergeno|DESCRIPCIO|FOTO_activado|\n");
+
+        var result = Scan(directory.Path);
+
+        Assert.NotNull(result.Sources[0].DataSource);
+        Assert.EndsWith("alergenos.csv", result.Sources[0].DataSource!.Location, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Scanner_RejectsCsvWithoutTxt()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "a|b|\n");
+
+        var result = Scan(directory.Path);
+
+        Assert.Empty(result.Sources);
+        Assert.Single(result.OrphanDataFiles);
+        Assert.Contains(result.Errors, error => error.Contains("huérfano", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void StructureParser_ReadsTableName()
+    {
+        Assert.Equal("alergenos", _parser.Parse(AlergenosTxt).Name);
+    }
+
+    [Fact]
+    public void StructureParser_ReadsDbLong()
+    {
+        var column = _parser.Parse(AlergenosTxt).Columns[0];
+        Assert.Equal("id_alergeno", column.Name);
+        Assert.Equal("dbLong", column.SourceTypeName);
+        Assert.Equal(4, column.Size);
+    }
+
+    [Fact]
+    public void StructureParser_ReadsDbTextSize()
+    {
+        var column = _parser.Parse(AlergenosTxt).Columns[1];
+        Assert.Equal("DESCRIPCIO", column.Name);
+        Assert.Equal("dbText", column.SourceTypeName);
+        Assert.Equal(30, column.Size);
+    }
+
+    [Fact]
+    public void StructureParser_ReadsDbLongBinary()
+    {
+        var column = _parser.Parse(AlergenosTxt).Columns[2];
+        Assert.Equal("FOTO_activado", column.Name);
+        Assert.Equal("dbLongBinary", column.SourceTypeName);
+    }
+
+    [Fact]
+    public void StructureParser_ReadsUniqueNonPrimaryIndex()
+    {
+        var index = Assert.Single(_parser.Parse(AlergenosTxt).Indexes);
+        Assert.Equal("id_alergeno", index.Name);
+        Assert.False(index.IsPrimaryKey);
+        Assert.True(index.IsUnique);
+        Assert.Equal("id_alergeno", index.Columns[0].Name);
+    }
+
+    [Fact]
+    public void DaoMapper_DbLongMapsToInt()
+    {
+        Assert.Equal("int", _mapper.Map(Column("id_alergeno", "dbLong", 4)).ToSql());
+    }
+
+    [Fact]
+    public void DaoMapper_DbText30MapsToNvarchar30()
+    {
+        Assert.Equal("nvarchar(30)", _mapper.Map(Column("DESCRIPCIO", "dbText", 30)).ToSql());
+    }
+
+    [Fact]
+    public void DaoMapper_DbLongBinaryMapsToVarbinaryMax()
+    {
+        Assert.Equal("varbinary(max)", _mapper.Map(Column("FOTO_activado", "dbLongBinary")).ToSql());
+    }
+
+    [Fact]
+    public async Task SchemaOnly_CreatesTableWithoutCsv()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        var sql = new FakeSql();
+        var copy = new FakeCopy();
+        var result = await Import(directory.Path, sql, copy);
+
+        Assert.True(sql.Created.ContainsKey("alergenos"));
+        Assert.Equal(0, copy.Calls);
+        var table = Assert.Single(result.Tables);
+        Assert.Equal(SchemaStatus.Created, table.SchemaStatus);
+        Assert.Equal("int", sql.Created["alergenos"].Columns[0].SourceTypeName == "dbLong"
+            ? _mapper.Map(sql.Created["alergenos"].Columns[0]).ToSql()
+            : null);
+    }
+
+    [Fact]
+    public async Task SchemaOnly_CreatesIndexesWithoutCsv()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        var sql = new FakeSql();
+        await Import(directory.Path, sql, new FakeCopy());
+
+        Assert.Contains("alergenos", sql.IndexedTables);
+    }
+
+    [Fact]
+    public async Task SchemaOnly_IsSuccessWithoutData()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        var result = await Import(directory.Path, new FakeSql(), new FakeCopy());
+        var table = Assert.Single(result.Tables);
+
+        Assert.Equal(SchemaStatus.Created, table.SchemaStatus);
+        Assert.Equal(DataStatus.NotAvailable, table.DataStatus);
+        Assert.Equal(0, table.ImportedRowCount);
+        Assert.Equal(ImportStatus.Success, table.Status);
+        Assert.True(result.IsSuccessful);
+    }
+
+    [Fact]
+    public void CsvHeader_IgnoresTrailingEmptyField()
+    {
+        using var directory = new TempDir();
+        var path = Path.Combine(directory.Path, "t.csv");
+        File.WriteAllText(path, "id_alergeno|DESCRIPCIO|FOTO_activado|\n");
+        var header = new CsvLegacyDataSource(path).ReadHeader();
+
+        Assert.Equal(["id_alergeno", "DESCRIPCIO", "FOTO_activado"], header);
+    }
+
+    [Fact]
+    public void CsvHeader_MatchesStructure()
+    {
+        var schema = _parser.Parse(AlergenosTxt);
+        CsvHeaderValidator.EnsureMatches(
+            ["id_alergeno", "DESCRIPCIO", "FOTO_activado"],
+            schema);
+    }
+
+    [Fact]
+    public void CsvHeader_MismatchDoesNotInvalidateParsedSchema()
+    {
+        var schema = _parser.Parse(AlergenosTxt);
+        Assert.Equal(3, schema.Columns.Count);
+        Assert.Throws<CsvHeaderMismatchException>(() =>
+            CsvHeaderValidator.EnsureMatches(["id_alergeno", "OTRO"], schema));
+        Assert.Equal("alergenos", schema.Name);
+        Assert.Equal("dbLong", schema.Columns[0].SourceTypeName);
+    }
+
+    [Fact]
+    public void CsvReader_Windows1252()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        using var directory = new TempDir();
+        var path = Path.Combine(directory.Path, "nombres.csv");
+        var encoding = Encoding.GetEncoding("windows-1252");
+        File.WriteAllBytes(path, encoding.GetBytes("nombre|\nEspaña|\n"));
+        var source = new CsvLegacyDataSource(path);
+        var schema = new LegacyTableSchema(
+            "nombres",
+            [Column("nombre", "dbText", 30)],
+            []);
+        using var reader = source.OpenReader(schema);
+
+        Assert.True(reader.Read());
+        Assert.Equal("España", reader.GetString(0));
+    }
+
+    [Fact]
+    public void BinaryDecoder_DecodesBase64()
+    {
+        var original = "BMPDATA"u8.ToArray();
+        var encoded = Convert.ToBase64String(original);
+        Assert.Equal(original, Base64Decoder.Decode(encoded));
+    }
+
+    [Fact]
+    public void BinaryDecoder_ExtractsValidBmp()
+    {
+        var bmp = MinimalBmp();
+        var wrapped = new byte[20 + bmp.Length];
+        wrapped[0] = 0x6C;
+        wrapped[1] = 0x74;
+        Buffer.BlockCopy(bmp, 0, wrapped, 20, bmp.Length);
+
+        var extracted = LegacyBinaryPayloadInterpreter.Interpret(wrapped);
+
+        Assert.Equal(bmp, extracted);
+        Assert.Equal(0x42, extracted[0]);
+        Assert.Equal(0x4D, extracted[1]);
+    }
+
+    [Fact]
+    public void BinaryDecoder_DoesNotCorruptGenericBinary()
+    {
+        var payload = Enumerable.Range(0, 64).Select(value => (byte)value).ToArray();
+        Assert.Equal(payload, LegacyBinaryPayloadInterpreter.Interpret(payload));
+    }
+
+    [Fact]
+    public void StructureHash_IsStable()
+    {
+        using var directory = new TempDir();
+        var path = Path.Combine(directory.Path, "alergenos.txt");
+        File.WriteAllText(path, AlergenosTxt);
+        Assert.Equal(
+            FileHashCalculator.CalculateSha256(path),
+            FileHashCalculator.CalculateSha256(path));
+    }
+
+    [Fact]
+    public void DataHash_IsStable()
+    {
+        using var directory = new TempDir();
+        var path = Path.Combine(directory.Path, "alergenos.csv");
+        File.WriteAllText(path, "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|GLUTEN||\n");
+        Assert.Equal(
+            FileHashCalculator.CalculateSha256(path),
+            FileHashCalculator.CalculateSha256(path));
+    }
+
+    [Fact]
+    public void StructureHash_ChangesWhenTxtChanges()
+    {
+        using var directory = new TempDir();
+        var path = Path.Combine(directory.Path, "alergenos.txt");
+        File.WriteAllText(path, AlergenosTxt);
+        var first = FileHashCalculator.CalculateSha256(path);
+        File.WriteAllText(path, AlergenosTxt + "\n");
+        Assert.NotEqual(first, FileHashCalculator.CalculateSha256(path));
+    }
+
+    [Fact]
+    public void DataHash_ChangesWhenCsvChanges()
+    {
+        using var directory = new TempDir();
+        var path = Path.Combine(directory.Path, "alergenos.csv");
+        File.WriteAllText(path, "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|GLUTEN||\n");
+        var first = FileHashCalculator.CalculateSha256(path);
+        File.WriteAllText(path, "id_alergeno|DESCRIPCIO|FOTO_activado|\n2|HUEVOS||\n");
+        Assert.NotEqual(first, FileHashCalculator.CalculateSha256(path));
+    }
+
+    [Fact]
+    public async Task CsvAppearsLater_IsImportedWithoutRecreatingSchema()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
+        var sql = new FakeSql();
+        var copy = new FakeCopy();
+        await Import(directory.Path, sql, copy);
+        Assert.Equal(1, sql.CreateCalls);
+        Assert.Equal(0, copy.Calls);
+
+        File.WriteAllText(
+            Path.Combine(directory.Path, "productos.csv"),
+            "id|nombre|\n1|pan|\n");
+        sql.Existing["productos"] = ToSql(sql.Created["productos"]);
+        sql.Created.Clear();
+        await Import(directory.Path, sql, copy);
+
+        Assert.Equal(1, sql.CreateCalls);
+        Assert.Equal(1, copy.Calls);
+        Assert.Equal(SchemaStatus.AlreadyExists, copy.LastResult?.SchemaStatus ?? SchemaStatus.AlreadyExists);
+    }
+
+    [Fact]
+    public async Task SameCsvSecondRun_IsSkipped()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
+        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "id|nombre|\n1|pan|\n");
+        var sql = new FakeSql();
+        var copy = new FakeCopy();
+        var history = new FakeHistory();
+        var first = await Import(directory.Path, sql, copy, history);
+        sql.Existing["productos"] = ToSql(sql.Created["productos"]);
+        var second = await Import(directory.Path, sql, copy, history);
+
+        Assert.Equal(DataStatus.Imported, first.Tables[0].DataStatus);
+        Assert.Equal(DataStatus.AlreadyImported, second.Tables[0].DataStatus);
+        Assert.Equal(ImportStatus.SkippedAlreadyImported, second.Tables[0].Status);
+        Assert.Equal(1, copy.Calls);
+    }
+
+    [Fact]
+    public async Task ExistingSqlTable_IsComparedEvenWithoutCsv()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        var schema = _parser.Parse(AlergenosTxt);
+        var sql = new FakeSql
+        {
+            Existing =
+            {
+                ["alergenos"] = ToSql(schema)
+            }
+        };
+        var result = await Import(directory.Path, sql, new FakeCopy());
+
+        Assert.Equal(0, sql.CreateCalls);
+        Assert.True(sql.Compared);
+        Assert.Equal(SchemaStatus.AlreadyExists, result.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.NotAvailable, result.Tables[0].DataStatus);
+    }
+
+    [Fact]
+    public async Task ExistingIncompatibleSchema_BlocksEvenWithoutCsv()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        var sql = new FakeSql
+        {
+            Existing =
+            {
+                ["alergenos"] = new SqlTableSchema(
+                    "alergenos",
+                    [
+                        new("id_alergeno", new("int"), true, false, 0),
+                        new("DESCRIPCIO", new("int"), true, false, 1),
+                        new("FOTO_activado", new("varbinary", -1), true, false, 2)
+                    ],
+                    [])
+            }
+        };
+        var copy = new FakeCopy();
+        var result = await Import(directory.Path, sql, copy);
+
+        Assert.Equal(SchemaStatus.Conflict, result.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.NotProcessed, result.Tables[0].DataStatus);
+        Assert.Equal(ImportStatus.Conflict, result.Tables[0].Status);
+        Assert.Equal(0, copy.Calls);
+        Assert.False(result.IsSuccessful);
+    }
+
+    [Fact]
+    public void UniqueIndex_DoesNotBecomePrimaryKey()
+    {
+        var schema = _parser.Parse(AlergenosTxt);
+        var sql = new LegacySqlDdlBuilder(_mapper).BuildCreateIndexSql(schema, "alergenos");
+        var statement = Assert.Single(sql);
+        Assert.Contains("UNIQUE INDEX", statement, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("PRIMARY KEY", statement, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void LogicalName_MismatchIsError()
+    {
+        Assert.Throws<SchemaNameMismatchException>(() =>
+            LegacyLogicalNameValidator.EnsureMatchesFile("alergenos.txt", "productos"));
+    }
+
+    private static LegacyImportCoordinator Coordinator(
+        string sourceDirectory,
+        FakeSql sql,
+        FakeCopy copy,
+        FakeHistory? history = null)
+    {
+        var options = new LegacyImportOptions { SourceDirectory = sourceDirectory };
+        var mapper = new DaoToSqlTypeMapper();
+        copy.History = history ?? new FakeHistory();
+        copy.CoordinatorResults = null;
+        return new LegacyImportCoordinator(
+            new FileLegacyTableSourceScanner(options),
+            mapper,
+            new SchemaComparisonService(mapper),
+            sql,
+            copy,
+            copy.History,
+            options);
+    }
+
+    private static async Task<PipelineResult> Import(
+        string sourceDirectory,
+        FakeSql sql,
+        FakeCopy copy,
+        FakeHistory? history = null)
+    {
+        var coordinator = Coordinator(sourceDirectory, sql, copy, history);
+        var result = await coordinator.ImportAsync();
+        copy.LastResult = result.Tables.LastOrDefault();
+        return result;
+    }
+
+    private static LegacyDiscoveryResult Scan(string directory)
+    {
+        return new FileLegacyTableSourceScanner(new LegacyImportOptions())
+            .Discover(directory);
+    }
+
+    private static LegacyColumnSchema Column(string name, string type, int? size = null)
+    {
+        return new(name, type, size, null, null, 0, true, false);
+    }
+
+    private static string TableTxt(string name)
+    {
+        return $"""
+            Nombre Tabla={name}
+            Estructura:
+            Nombre Campo=id Tipo=dbLong Entero largo, size=4
+            Nombre Campo=nombre Tipo=dbText Texto, size=30
+            """;
+    }
+
+    private static SqlTableSchema ToSql(LegacyTableSchema schema)
+    {
+        var mapper = new DaoToSqlTypeMapper();
+        return new(
+            schema.Name,
+            schema.Columns.Select(column =>
+                new SqlColumnSchema(
+                    column.Name,
+                    mapper.Map(column),
+                    column.IsNullable,
+                    column.IsAutoIncrement,
+                    column.Ordinal)).ToArray(),
+            schema.Indexes);
+    }
+
+    private static byte[] MinimalBmp()
+    {
+        var data = new byte[58];
+        data[0] = 0x42;
+        data[1] = 0x4D;
+        BitConverter.GetBytes(58).CopyTo(data, 2);
+        BitConverter.GetBytes(54).CopyTo(data, 10);
+        BitConverter.GetBytes(40).CopyTo(data, 14);
+        BitConverter.GetBytes(1).CopyTo(data, 18);
+        BitConverter.GetBytes(1).CopyTo(data, 22);
+        BitConverter.GetBytes((short)1).CopyTo(data, 26);
+        BitConverter.GetBytes((short)24).CopyTo(data, 28);
+        return data;
+    }
+
+    private sealed class FakeSql : ILegacySqlSchemaPort
+    {
+        public Dictionary<string, LegacyTableSchema> Created { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, SqlTableSchema> Existing { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> IndexedTables { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public int CreateCalls { get; private set; }
+        public bool Compared { get; private set; }
+
+        public Task<bool> TableExistsAsync(string tableName, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(Existing.ContainsKey(tableName) || Created.ContainsKey(tableName));
+        }
+
+        public Task CreateTableAsync(LegacyTableSchema table, CancellationToken cancellationToken)
+        {
+            CreateCalls++;
+            Created[table.Name] = table;
+            return Task.CompletedTask;
+        }
+
+        public Task CreateIndexesAsync(LegacyTableSchema table, CancellationToken cancellationToken)
+        {
+            IndexedTables.Add(table.Name);
+            return Task.CompletedTask;
+        }
+
+        public Task<SqlTableSchema> ReadTableSchemaAsync(string tableName, CancellationToken cancellationToken)
+        {
+            Compared = true;
+            return Task.FromResult(Existing[tableName]);
+        }
+
+        public Task<long> CountRowsAsync(string tableName, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(0L);
+        }
+    }
+
+    private sealed class FakeCopy : ILegacyDataCopyPort
+    {
+        public int Calls { get; private set; }
+        public TableImportResult? LastResult { get; set; }
+        public FakeHistory History { get; set; } = new();
+        public object? CoordinatorResults { get; set; }
+
+        public Task<long> CopyAsync(
+            LegacyTableSchema schema,
+            ILegacyDataSource dataSource,
+            string destinationTableName,
+            long expectedRowCount,
+            CancellationToken cancellationToken)
+        {
+            Calls++;
+            History.Imported.Add((destinationTableName, FileHashCalculator.CalculateSha256(dataSource.Location)));
+            return Task.FromResult(expectedRowCount);
+        }
+    }
+
+    private sealed class FakeHistory : ILegacyImportHistoryPort
+    {
+        public HashSet<(string Table, string Hash)> Imported { get; } = [];
+
+        public Task<bool> WasDataImportedAsync(
+            string tableName,
+            string dataHash,
+            CancellationToken cancellationToken)
+        {
+            return Task.FromResult(Imported.Contains((tableName, dataHash)));
+        }
+
+        public Task<long> RecordStartAsync(TableImportResult draft, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(1L);
+        }
+
+        public Task RecordFinishAsync(
+            long id,
+            TableImportResult result,
+            CancellationToken cancellationToken)
+        {
+            if (result.DataStatus == DataStatus.Imported && result.DataHash is not null)
+            {
+                Imported.Add((result.TableName, result.DataHash));
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class TempDir : IDisposable
+    {
+        public TempDir()
+        {
+            Path = Directory.CreateTempSubdirectory().FullName;
+        }
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            Directory.Delete(Path, true);
+        }
+    }
+}

@@ -13,8 +13,3 @@ public static class PipelineJson
         Converters = { new JsonStringEnumConverter() }
     };
 }
-
-public sealed class DecisionFile
-{
-    public List<TableDecision> Items { get; set; } = [];
-}

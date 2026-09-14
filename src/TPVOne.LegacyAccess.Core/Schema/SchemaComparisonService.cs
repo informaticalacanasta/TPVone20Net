@@ -1,18 +1,19 @@
+using TPVOne.LegacyAccess.Core.Mapping;
 using TPVOne.LegacyAccess.Core.Models;
 
 namespace TPVOne.LegacyAccess.Core.Schema;
 
 public sealed class SchemaComparisonService
 {
-    private readonly AccessToSqlTypeMapper _typeMapper;
+    private readonly DaoToSqlTypeMapper _typeMapper;
 
-    public SchemaComparisonService(AccessToSqlTypeMapper typeMapper)
+    public SchemaComparisonService(DaoToSqlTypeMapper typeMapper)
     {
         _typeMapper = typeMapper;
     }
 
     public IReadOnlyList<SchemaDifference> Compare(
-        AccessTableSchema accessTable,
+        LegacyTableSchema sourceTable,
         SqlTableSchema sqlTable)
     {
         var differences = new List<SchemaDifference>();
@@ -20,19 +21,19 @@ public sealed class SchemaComparisonService
             column => column.Name,
             StringComparer.OrdinalIgnoreCase);
 
-        foreach (var accessColumn in accessTable.Columns)
+        foreach (var sourceColumn in sourceTable.Columns)
         {
-            if (!sqlColumns.Remove(accessColumn.Name, out var sqlColumn))
+            if (!sqlColumns.Remove(sourceColumn.Name, out var sqlColumn))
             {
                 differences.Add(new(
                     SchemaDifferenceKind.MissingColumn,
-                    accessColumn.Name,
-                    "La columna de Access no existe en SQL Server.",
+                    sourceColumn.Name,
+                    "La columna de origen no existe en SQL Server.",
                     true));
                 continue;
             }
 
-            CompareColumn(accessColumn, sqlColumn, differences);
+            CompareColumn(sourceColumn, sqlColumn, differences);
         }
 
         foreach (var extraColumn in sqlColumns.Values)
@@ -44,13 +45,13 @@ public sealed class SchemaComparisonService
                 !extraColumn.IsNullable && !extraColumn.IsIdentity));
         }
 
-        CompareKeysAndIndexes(accessTable, sqlTable, differences);
+        CompareKeysAndIndexes(sourceTable, sqlTable, differences);
 
         if (differences.Count == 0)
         {
             differences.Add(new(
                 SchemaDifferenceKind.ExactMatch,
-                accessTable.Name,
+                sourceTable.Name,
                 "Los esquemas coinciden.",
                 false));
         }
@@ -59,11 +60,11 @@ public sealed class SchemaComparisonService
     }
 
     private void CompareColumn(
-        AccessColumnSchema access,
+        LegacyColumnSchema source,
         SqlColumnSchema sql,
         ICollection<SchemaDifference> differences)
     {
-        var expected = _typeMapper.Map(access);
+        var expected = _typeMapper.Map(source);
         if (!string.Equals(
                 expected.TypeName,
                 sql.Type.TypeName,
@@ -71,8 +72,8 @@ public sealed class SchemaComparisonService
         {
             differences.Add(new(
                 SchemaDifferenceKind.TypeMismatch,
-                access.Name,
-                $"Access requiere {expected.ToSql()} y SQL tiene {sql.Type.ToSql()}.",
+                source.Name,
+                $"El origen requiere {expected.ToSql()} y SQL tiene {sql.Type.ToSql()}.",
                 true));
             return;
         }
@@ -82,7 +83,7 @@ public sealed class SchemaComparisonService
         {
             differences.Add(new(
                 SchemaDifferenceKind.SizeMismatch,
-                access.Name,
+                source.Name,
                 $"SQL {sql.Type.ToSql()} no admite el tamaño {expected.ToSql()}.",
                 true));
         }
@@ -92,33 +93,33 @@ public sealed class SchemaComparisonService
         {
             differences.Add(new(
                 SchemaDifferenceKind.SizeMismatch,
-                access.Name,
+                source.Name,
                 $"SQL {sql.Type.ToSql()} no admite {expected.ToSql()}.",
                 true));
         }
-        else if (!Equals(expected, sql.Type))
+        else if (!AreEquivalent(expected, sql.Type))
         {
             differences.Add(new(
                 SchemaDifferenceKind.Compatible,
-                access.Name,
+                source.Name,
                 $"SQL {sql.Type.ToSql()} puede contener {expected.ToSql()}.",
                 false));
         }
 
-        if (access.IsNullable && !sql.IsNullable)
+        if (source.IsNullable && !sql.IsNullable)
         {
             differences.Add(new(
                 SchemaDifferenceKind.NullabilityMismatch,
-                access.Name,
-                "Access admite NULL pero SQL Server no.",
+                source.Name,
+                "El origen admite NULL pero SQL Server no.",
                 true));
         }
 
-        if (access.IsAutoIncrement != sql.IsIdentity)
+        if (source.IsAutoIncrement != sql.IsIdentity)
         {
             differences.Add(new(
                 SchemaDifferenceKind.TypeMismatch,
-                access.Name,
+                source.Name,
                 "La configuración AutoNumber/IDENTITY no coincide.",
                 true));
         }
@@ -132,18 +133,43 @@ public sealed class SchemaComparisonService
             destinationLength >= sourceLength;
     }
 
+    private static bool AreEquivalent(SqlTypeDefinition expected, SqlTypeDefinition actual)
+    {
+        if (!string.Equals(expected.TypeName, actual.TypeName, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (expected.TypeName is "nvarchar" or "varbinary")
+        {
+            return NormalizeLength(expected.MaxLength) == NormalizeLength(actual.MaxLength);
+        }
+
+        if (expected.TypeName == "decimal")
+        {
+            return expected.Precision == actual.Precision && expected.Scale == actual.Scale;
+        }
+
+        return true;
+    }
+
+    private static int NormalizeLength(int? length)
+    {
+        return length is null or < 0 ? -1 : length.Value;
+    }
+
     private static void CompareKeysAndIndexes(
-        AccessTableSchema access,
+        LegacyTableSchema source,
         SqlTableSchema sql,
         ICollection<SchemaDifference> differences)
     {
-        var accessPrimary = Signature(access.Indexes.FirstOrDefault(index => index.IsPrimaryKey));
+        var sourcePrimary = Signature(source.Indexes.FirstOrDefault(index => index.IsPrimaryKey));
         var sqlPrimary = Signature(sql.Indexes.FirstOrDefault(index => index.IsPrimaryKey));
-        if (!string.Equals(accessPrimary, sqlPrimary, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(sourcePrimary, sqlPrimary, StringComparison.OrdinalIgnoreCase))
         {
             differences.Add(new(
                 SchemaDifferenceKind.PrimaryKeyMismatch,
-                access.Name,
+                source.Name,
                 "La clave primaria no coincide.",
                 false));
         }
@@ -152,20 +178,20 @@ public sealed class SchemaComparisonService
             .Where(index => !index.IsPrimaryKey)
             .Select(Signature)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (access.Indexes
+        if (source.Indexes
             .Where(index => !index.IsPrimaryKey)
             .Select(Signature)
             .Any(signature => !sqlIndexes.Contains(signature)))
         {
             differences.Add(new(
                 SchemaDifferenceKind.IndexMismatch,
-                access.Name,
-                "Uno o varios índices de Access no existen en SQL Server.",
+                source.Name,
+                "Uno o varios índices de origen no existen en SQL Server.",
                 false));
         }
     }
 
-    private static string Signature(AccessIndexSchema? index)
+    private static string Signature(LegacyIndexSchema? index)
     {
         return index is null
             ? string.Empty

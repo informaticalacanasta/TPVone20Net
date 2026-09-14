@@ -1,43 +1,32 @@
 namespace TPVOne.LegacyAccess.Core.Models;
 
-public enum ExistingTableAction
+public enum SchemaStatus
 {
-    Skip,
-    Replace,
-    Cancel
+    Created,
+    AlreadyExists,
+    Compatible,
+    Conflict,
+    Failed,
+    NotProcessed
+}
+
+public enum DataStatus
+{
+    Imported,
+    AlreadyImported,
+    NotAvailable,
+    Failed,
+    NotProcessed
 }
 
 public enum PlannedTableStatus
 {
     Create,
     SkipAlreadyImported,
-    RequiresDecision,
+    Compatible,
     Collision,
+    Conflict,
     Failed
-}
-
-public enum ConversionAction
-{
-    SkipAlreadyConverted,
-    CopyCompatible,
-    ConvertToJet4,
-    Reconvert
-}
-
-public enum AccessJetFormat
-{
-    Unknown,
-    Jet3Access97,
-    Jet4Access2000,
-    AceAccdb
-}
-
-public sealed class LegacyAccessImportOptions
-{
-    public string SourceDirectory { get; set; } = string.Empty;
-    public string ConvertedDirectory { get; set; } = string.Empty;
-    public int BatchSize { get; set; } = 5000;
-    public int CommandTimeoutSeconds { get; set; } = 120;
 }
 
 public enum ImportStatus
@@ -45,17 +34,28 @@ public enum ImportStatus
     Success,
     CompletedWithErrors,
     SkippedAlreadyImported,
-    SkippedByUser,
-    Replaced,
     Conflict,
-    Failed,
-    Cancelled
+    Failed
+}
+
+public sealed class LegacyImportOptions
+{
+    public string SourceDirectory { get; set; } = string.Empty;
+    public int BatchSize { get; set; } = 5000;
+    public int CommandTimeoutSeconds { get; set; } = 120;
+    public bool ForceImport { get; set; }
+    public string DefaultEncoding { get; set; } = "windows-1252";
+    public string Delimiter { get; set; } = "|";
 }
 
 public sealed record TableImportResult(
-    string SourceFile,
-    string OriginalFile,
     string TableName,
+    string SchemaLocation,
+    string? DataLocation,
+    string StructureHash,
+    string? DataHash,
+    SchemaStatus SchemaStatus,
+    DataStatus DataStatus,
     ImportStatus Status,
     bool TableCreated,
     long SourceRowCount,
@@ -64,9 +64,10 @@ public sealed record TableImportResult(
     string? Error);
 
 public sealed record PlannedTable(
-    string OriginalFile,
-    string ConvertedFile,
-    string SourceHash,
+    string SchemaFile,
+    string? DataFile,
+    string StructureHash,
+    string? DataHash,
     string TableName,
     long SourceRowCount,
     bool SqlExists,
@@ -74,60 +75,57 @@ public sealed record PlannedTable(
     PlannedTableStatus Status,
     string Message);
 
-public sealed record TableDecision(
-    string SourceHash,
-    string TableName,
-    ExistingTableAction Action);
-
-public sealed record ConversionItemResult(
-    string OriginalFile,
-    string? ConvertedFile,
-    string SourceHash,
-    AccessJetFormat Format,
-    ConversionAction Action,
-    string Status,
-    string Message);
-
-public sealed record ConversionBatchResult(
-    int FilesFound,
-    int Converted,
-    int Copied,
-    int Skipped,
-    int Failed,
-    IReadOnlyList<ConversionItemResult> Items,
-    IReadOnlyList<string> Errors);
+public sealed record LegacyAnalysisItem(
+    string LogicalName,
+    string SchemaLocation,
+    string? DataLocation,
+    string StructureHash,
+    string? DataHash,
+    int ColumnCount,
+    int IndexCount,
+    long AvailableRecords,
+    bool HasDataSource,
+    IReadOnlyList<string> Warnings,
+    string? Error,
+    string? DataError = null);
 
 public sealed record PipelineResult(
     string Kind,
-    ConversionBatchResult? Conversion,
-    IReadOnlyList<AccessDatabaseSchema> Databases,
+    IReadOnlyList<LegacyAnalysisItem> Analysis,
     IReadOnlyList<PlannedTable> Plan,
     IReadOnlyList<TableImportResult> Tables,
+    IReadOnlyList<string> OrphanDataFiles,
     IReadOnlyList<string> Warnings,
     IReadOnlyList<string> Errors)
 {
-    public int FilesFound => Conversion?.FilesFound
-        ?? Databases.Select(database => database.OriginalFilePath ?? database.FilePath)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Count();
+    public int SchemaDefinitionsFound => Analysis.Count;
 
-    public int FilesOpened => Databases.Count;
+    public int ValidLegacyTables =>
+        Analysis.Count(item => item.Error is null);
 
-    public int UserTables => Plan.Count > 0
-        ? Plan.Count
-        : Databases.Sum(database => database.Tables.Count);
+    public int TablesWithoutData =>
+        Analysis.Count(item => item.Error is null && !item.HasDataSource);
 
-    public long TotalSourceRows => Plan.Count > 0
-        ? Plan.Sum(table => table.SourceRowCount)
-        : Databases.Sum(database => database.Tables.Sum(table => table.RowCount));
+    public int AssociatedDataSources =>
+        Analysis.Count(item => item.Error is null && item.HasDataSource);
+
+    public int OrphanDataSources => OrphanDataFiles.Count;
+
+    public int Columns =>
+        Analysis.Where(item => item.Error is null).Sum(item => item.ColumnCount);
+
+    public long AvailableRecords =>
+        Analysis.Where(item => item.Error is null).Sum(item => item.AvailableRecords);
 
     public bool IsSuccessful =>
         Errors.Count == 0 &&
-        (Conversion?.Failed ?? 0) == 0 &&
+        OrphanDataFiles.Count == 0 &&
+        Analysis.All(item => item.Error is null && item.DataError is null) &&
         Tables.All(table => table.Status is
             ImportStatus.Success or
-            ImportStatus.SkippedAlreadyImported or
-            ImportStatus.SkippedByUser or
-            ImportStatus.Replaced) &&
-        Plan.All(table => table.Status != PlannedTableStatus.Failed);
+            ImportStatus.SkippedAlreadyImported) &&
+        Plan.All(table => table.Status is not (
+            PlannedTableStatus.Failed or
+            PlannedTableStatus.Conflict or
+            PlannedTableStatus.Collision));
 }
