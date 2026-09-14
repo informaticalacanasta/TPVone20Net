@@ -19,7 +19,16 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\TPVOne.LegacyAccess.Core\TPVOne.LegacyAccess.Core.csproj" />
+    <ProjectReference Include="..\..\src\TPVOne.LegacyAccessImporter\TPVOne.LegacyAccessImporter.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\src\TPVOne\Database\Migrations\*.sql" Link="Migrations\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

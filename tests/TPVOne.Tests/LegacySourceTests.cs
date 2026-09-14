@@ -357,6 +357,44 @@ public sealed class LegacySourceTests
     }
 
     [Fact]
+    public async Task ForceImport_DoesNotSkipAlreadyImportedWhenTableIsEmpty()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
+        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "id|nombre|\n1|pan|\n");
+        var sql = new FakeSql();
+        var copy = new FakeCopy();
+        var history = new FakeHistory();
+        await Import(directory.Path, sql, copy, history);
+        sql.Existing["productos"] = ToSql(sql.Created["productos"]);
+
+        var forced = await Import(directory.Path, sql, copy, history, forceImport: true);
+
+        Assert.Equal(2, copy.Calls);
+        Assert.Equal(DataStatus.Imported, forced.Tables[0].DataStatus);
+    }
+
+    [Fact]
+    public async Task ForceImport_DoesNotTruncateWhenTableHasRows()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
+        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "id|nombre|\n1|pan|\n");
+        var sql = new FakeSql();
+        var copy = new FakeCopy();
+        var history = new FakeHistory();
+        await Import(directory.Path, sql, copy, history);
+        sql.Existing["productos"] = ToSql(sql.Created["productos"]);
+        sql.RowCounts["productos"] = 1;
+
+        var forced = await Import(directory.Path, sql, copy, history, forceImport: true);
+
+        Assert.Equal(1, copy.Calls);
+        Assert.Equal(DataStatus.Failed, forced.Tables[0].DataStatus);
+        Assert.Contains("no está vacía", forced.Tables[0].Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ExistingSqlTable_IsComparedEvenWithoutCsv()
     {
         using var directory = new TempDir();
@@ -427,9 +465,14 @@ public sealed class LegacySourceTests
         string sourceDirectory,
         FakeSql sql,
         FakeCopy copy,
-        FakeHistory? history = null)
+        FakeHistory? history = null,
+        bool forceImport = false)
     {
-        var options = new LegacyImportOptions { SourceDirectory = sourceDirectory };
+        var options = new LegacyImportOptions
+        {
+            SourceDirectory = sourceDirectory,
+            ForceImport = forceImport
+        };
         var mapper = new DaoToSqlTypeMapper();
         copy.History = history ?? new FakeHistory();
         copy.CoordinatorResults = null;
@@ -447,9 +490,10 @@ public sealed class LegacySourceTests
         string sourceDirectory,
         FakeSql sql,
         FakeCopy copy,
-        FakeHistory? history = null)
+        FakeHistory? history = null,
+        bool forceImport = false)
     {
-        var coordinator = Coordinator(sourceDirectory, sql, copy, history);
+        var coordinator = Coordinator(sourceDirectory, sql, copy, history, forceImport);
         var result = await coordinator.ImportAsync();
         copy.LastResult = result.Tables.LastOrDefault();
         return result;
@@ -511,6 +555,7 @@ public sealed class LegacySourceTests
         public Dictionary<string, LegacyTableSchema> Created { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, SqlTableSchema> Existing { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> IndexedTables { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, long> RowCounts { get; } = new(StringComparer.OrdinalIgnoreCase);
         public int CreateCalls { get; private set; }
         public bool Compared { get; private set; }
 
@@ -540,7 +585,7 @@ public sealed class LegacySourceTests
 
         public Task<long> CountRowsAsync(string tableName, CancellationToken cancellationToken)
         {
-            return Task.FromResult(0L);
+            return Task.FromResult(RowCounts.GetValueOrDefault(tableName));
         }
     }
 

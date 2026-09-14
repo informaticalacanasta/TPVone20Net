@@ -20,4 +20,10 @@
     <ProjectReference Include="..\TPVOne.LegacyAccess.Core\TPVOne.LegacyAccess.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>TPVOne.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
 </Project>

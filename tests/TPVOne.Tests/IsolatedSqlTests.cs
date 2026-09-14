@@ -1,0 +1,431 @@
+using Microsoft.Data.SqlClient;
+using TPVOne.LegacyAccess.Core.Import;
+using TPVOne.LegacyAccess.Core.Mapping;
+using TPVOne.LegacyAccess.Core.Models;
+using TPVOne.LegacyAccess.Core.Schema;
+using TPVOne.LegacyAccess.Core.Sources;
+using TPVOne.LegacyAccessImporter.Database;
+using TPVOne.LegacyAccessImporter.Import;
+
+namespace TPVOne.Tests;
+
+public sealed class IsolatedSqlTests
+{
+    private static readonly string[] ForbiddenLegacyTables =
+    [
+        "HORAS",
+        "pedidos_tmp",
+        "pedidos_tmpp",
+        "tiquetssii"
+    ];
+
+    private static readonly string[] TechnicalTables =
+    [
+        "SchemaMigrations",
+        "LegacyImportHistory",
+        "LegacyAccessConversionHistory"
+    ];
+
+    [Fact]
+    public void InitialSchema_DoesNotPrecreateLegacyTables()
+    {
+        var sql = File.ReadAllText(MigrationPath("001_InitialSchema.sql"));
+
+        Assert.DoesNotContain("CREATE TABLE dbo.HORAS", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("CREATE TABLE dbo.pedidos_tmp", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("CREATE TABLE dbo.pedidos_tmpp", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("CREATE TABLE dbo.tiquetssii", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("dbo.alergenos", sql, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [SqlFact]
+    public async Task NewDatabase_CreatesOnlyTechnicalInfrastructure()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        var tables = await database.ListUserTablesAsync();
+
+        Assert.NotEqual("TPVONE", database.DatabaseName);
+        Assert.StartsWith("TPVONE_TESTS_", database.DatabaseName, StringComparison.Ordinal);
+        foreach (var forbidden in ForbiddenLegacyTables)
+        {
+            Assert.DoesNotContain(forbidden, tables, StringComparer.OrdinalIgnoreCase);
+        }
+
+        foreach (var technical in TechnicalTables)
+        {
+            Assert.Contains(technical, tables, StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    [SqlFact]
+    public async Task ImportingAlergenosOnly_CreatesOnlyThatLegacyTable()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateSchemaOnly();
+        var result = await ImportAsync(database, source.Path);
+
+        var tables = await database.ListUserTablesAsync();
+        var legacyTables = tables
+            .Except(TechnicalTables, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        Assert.True(result.IsSuccessful);
+        Assert.Equal(["alergenos"], legacyTables, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(SchemaStatus.Created, result.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.NotAvailable, result.Tables[0].DataStatus);
+        Assert.Equal(0, result.Tables[0].ImportedRowCount);
+
+        var foto = await database.ReadColumnTypeAsync("alergenos", "FOTO_activado");
+        Assert.Equal("varbinary", foto.TypeName, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(-1, foto.MaxLength);
+    }
+
+    [SqlFact]
+    public async Task IdenticalSecondImport_IsSkippedAlreadyImported()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+
+        var first = await ImportAsync(database, source.Path);
+        var second = await ImportAsync(database, source.Path);
+        var rows = await database.CountRowsAsync("alergenos");
+        var history = await database.ReadHistoryStatusesAsync("alergenos");
+
+        Assert.Equal(ImportStatus.Success, first.Tables[0].Status);
+        Assert.Equal(DataStatus.Imported, first.Tables[0].DataStatus);
+        Assert.Equal(2, first.Tables[0].ImportedRowCount);
+        Assert.Equal(ImportStatus.SkippedAlreadyImported, second.Tables[0].Status);
+        Assert.Equal(DataStatus.AlreadyImported, second.Tables[0].DataStatus);
+        Assert.Equal(0, second.Tables[0].ImportedRowCount);
+        Assert.Equal(2, rows);
+        Assert.Equal(
+            ["Success", "SkippedAlreadyImported"],
+            history);
+    }
+
+    [SqlFact]
+    public async Task ForceImport_DoesNotTruncateExistingRows()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+
+        var forced = await ImportAsync(database, source.Path, forceImport: true);
+        var rows = await database.CountRowsAsync("alergenos");
+
+        Assert.Equal(DataStatus.Failed, forced.Tables[0].DataStatus);
+        Assert.Equal(2, rows);
+        Assert.Contains("no está vacía", forced.Tables[0].Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<PipelineResult> ImportAsync(
+        IsolatedSqlDatabase database,
+        string sourceDirectory,
+        bool forceImport = false)
+    {
+        var options = new LegacyImportOptions
+        {
+            SourceDirectory = sourceDirectory,
+            ForceImport = forceImport
+        };
+        var mapper = new DaoToSqlTypeMapper();
+        var schema = new SqlServerSchemaService(database.ConnectionString, mapper, 30);
+        var bulk = new SqlBulkImporter(database.ConnectionString, schema, options);
+        var history = new ImportHistoryService(database.ConnectionString, 30);
+        var coordinator = new LegacyImportCoordinator(
+            new FileLegacyTableSourceScanner(options),
+            mapper,
+            new SchemaComparisonService(mapper),
+            schema,
+            bulk,
+            history,
+            options);
+        return await coordinator.ImportAsync();
+    }
+
+    private static string MigrationPath(string fileName)
+    {
+        return Path.Combine(AppContext.BaseDirectory, "Migrations", fileName);
+    }
+}
+
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
+internal sealed class SqlFactAttribute : FactAttribute
+{
+    public SqlFactAttribute()
+    {
+        if (!IsolatedSqlDatabase.IsAvailable)
+        {
+            Skip = "SQL Server no está disponible en localhost.";
+        }
+    }
+}
+
+file static class AlergenosFixture
+{
+    private const string Txt = """
+        Nombre Tabla=alergenos
+        Estructura:
+        Nombre Campo=id_alergeno Tipo=dbLong  Entero largo, size=4
+        Nombre Campo=DESCRIPCIO Tipo=dbText Texto, size=30
+        Nombre Campo=FOTO_activado Tipo=dbLongBinary    Objeto OLE / binario largo
+        Indices:
+        Nombre Indice: id_alergeno
+         Es Primary: False
+         Es Unique: True
+         Campos:
+            - id_alergeno
+        """;
+
+    public static TempDir CreateSchemaOnly()
+    {
+        var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), Txt);
+        return directory;
+    }
+
+    public static TempDir CreateWithCsv()
+    {
+        var directory = CreateSchemaOnly();
+        File.WriteAllText(
+            Path.Combine(directory.Path, "alergenos.csv"),
+            "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|GLUTEN||\n2|HUEVOS||\n");
+        return directory;
+    }
+}
+
+file sealed class TempDir : IDisposable
+{
+    public TempDir()
+    {
+        Path = Directory.CreateTempSubdirectory().FullName;
+    }
+
+    public string Path { get; }
+
+    public void Dispose()
+    {
+        Directory.Delete(Path, true);
+    }
+}
+
+internal sealed class IsolatedSqlDatabase : IAsyncDisposable
+{
+    private const string MasterConnectionString =
+        "Server=localhost;Database=master;Integrated Security=true;TrustServerCertificate=true";
+
+    public static bool IsAvailable { get; } = Probe();
+
+    private IsolatedSqlDatabase(string databaseName, string connectionString)
+    {
+        DatabaseName = databaseName;
+        ConnectionString = connectionString;
+    }
+
+    public string DatabaseName { get; }
+
+    public string ConnectionString { get; }
+
+    public static async Task<IsolatedSqlDatabase> CreateAsync()
+    {
+        var databaseName = "TPVONE_TESTS_" + Guid.NewGuid().ToString("N");
+        Assert.NotEqual("TPVONE", databaseName);
+        Assert.StartsWith("TPVONE_TESTS_", databaseName, StringComparison.Ordinal);
+
+        await using (var master = new SqlConnection(MasterConnectionString))
+        {
+            await master.OpenAsync();
+            await using var create = new SqlCommand($"CREATE DATABASE [{databaseName}];", master)
+            {
+                CommandTimeout = 60
+            };
+            await create.ExecuteNonQueryAsync();
+        }
+
+        var builder = new SqlConnectionStringBuilder(MasterConnectionString)
+        {
+            InitialCatalog = databaseName
+        };
+        var database = new IsolatedSqlDatabase(databaseName, builder.ConnectionString);
+        try
+        {
+            await database.ApplyMigrationsAsync();
+            return database;
+        }
+        catch
+        {
+            await database.DisposeAsync();
+            throw;
+        }
+    }
+
+    public async Task<IReadOnlyList<string>> ListUserTablesAsync()
+    {
+        const string sql = """
+            SELECT name
+            FROM sys.tables
+            WHERE schema_id = SCHEMA_ID(N'dbo')
+            ORDER BY name;
+            """;
+        var tables = new List<string>();
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            tables.Add(reader.GetString(0));
+        }
+
+        return tables;
+    }
+
+    public async Task<(string TypeName, short MaxLength)> ReadColumnTypeAsync(
+        string tableName,
+        string columnName)
+    {
+        const string sql = """
+            SELECT ty.name, c.max_length
+            FROM sys.columns c
+            INNER JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+            WHERE c.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(@TableName), N'U')
+              AND c.name = @ColumnName;
+            """;
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.AddWithValue("@TableName", tableName);
+        command.Parameters.AddWithValue("@ColumnName", columnName);
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        return (reader.GetString(0), reader.GetInt16(1));
+    }
+
+    public async Task<long> CountRowsAsync(string tableName)
+    {
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand(
+            $"SELECT COUNT_BIG(*) FROM dbo.[{tableName.Replace("]", "]]", StringComparison.Ordinal)}];",
+            connection);
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    public async Task<IReadOnlyList<string>> ReadHistoryStatusesAsync(string tableName)
+    {
+        const string sql = """
+            SELECT Status
+            FROM dbo.LegacyImportHistory
+            WHERE TableName = @TableName
+            ORDER BY Id;
+            """;
+        var statuses = new List<string>();
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.AddWithValue("@TableName", tableName);
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            statuses.Add(reader.GetString(0));
+        }
+
+        return statuses;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await using var master = new SqlConnection(MasterConnectionString);
+        await master.OpenAsync();
+        var sql = $"""
+            IF DB_ID(N'{DatabaseName}') IS NOT NULL
+            BEGIN
+                ALTER DATABASE [{DatabaseName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+                DROP DATABASE [{DatabaseName}];
+            END
+            """;
+        await using var command = new SqlCommand(sql, master) { CommandTimeout = 60 };
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task ApplyMigrationsAsync()
+    {
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using (var createHistory = new SqlCommand(
+                         """
+                         IF OBJECT_ID(N'dbo.SchemaMigrations', N'U') IS NULL
+                         BEGIN
+                             CREATE TABLE dbo.SchemaMigrations
+                             (
+                                 MigrationId nvarchar(255) NOT NULL PRIMARY KEY,
+                                 AppliedAt datetime2 NOT NULL DEFAULT SYSDATETIME()
+                             );
+                         END
+                         """,
+                         connection))
+        {
+            await createHistory.ExecuteNonQueryAsync();
+        }
+
+        foreach (var file in Directory.GetFiles(
+                     Path.Combine(AppContext.BaseDirectory, "Migrations"),
+                     "*.sql").OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+        {
+            var id = Path.GetFileNameWithoutExtension(file);
+            foreach (var batch in SplitBatches(await File.ReadAllTextAsync(file)))
+            {
+                await using var command = new SqlCommand(batch, connection);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await using var insert = new SqlCommand(
+                "INSERT INTO dbo.SchemaMigrations (MigrationId) VALUES (@Id);",
+                connection);
+            insert.Parameters.AddWithValue("@Id", id);
+            await insert.ExecuteNonQueryAsync();
+        }
+    }
+
+    private static IEnumerable<string> SplitBatches(string sql)
+    {
+        var batch = new System.Text.StringBuilder();
+        using var reader = new StringReader(sql);
+        while (reader.ReadLine() is { } line)
+        {
+            if (line.Trim().Equals("GO", StringComparison.OrdinalIgnoreCase))
+            {
+                var text = batch.ToString().Trim();
+                if (text.Length > 0)
+                {
+                    yield return text;
+                }
+
+                batch.Clear();
+                continue;
+            }
+
+            batch.AppendLine(line);
+        }
+
+        var final = batch.ToString().Trim();
+        if (final.Length > 0)
+        {
+            yield return final;
+        }
+    }
+
+    private static bool Probe()
+    {
+        try
+        {
+            using var connection = new SqlConnection(MasterConnectionString);
+            connection.Open();
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+}
