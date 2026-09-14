@@ -29,7 +29,8 @@ internal sealed class LegacyDatabaseImportService
             schemaService,
             bulkImporter,
             historyService,
-            options);
+            options,
+            new ConsoleLegacyImportInteraction(options.OverwriteAll));
     }
 
     public async Task<PipelineResult> AnalyzeAsync(CancellationToken cancellationToken = default)

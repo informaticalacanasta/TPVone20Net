@@ -26,6 +26,7 @@ internal static class Program
                 BatchSize = arguments.BatchSize,
                 CommandTimeoutSeconds = arguments.CommandTimeoutSeconds,
                 ForceImport = arguments.ForceImport,
+                OverwriteAll = arguments.OverwriteAll,
                 DefaultEncoding = arguments.DefaultEncoding,
                 Delimiter = arguments.Delimiter
             };
@@ -85,6 +86,7 @@ internal static class Program
         var batchSize = 5000;
         var timeout = 120;
         var forceImport = false;
+        var overwriteAll = false;
         var encoding = "windows-1252";
         var delimiter = "|";
 
@@ -106,6 +108,9 @@ internal static class Program
                     break;
                 case "--force":
                     forceImport = true;
+                    break;
+                case "--overwrite-all":
+                    overwriteAll = true;
                     break;
                 case "--encoding":
                     encoding = ReadValue(args, ref index);
@@ -131,7 +136,7 @@ internal static class Program
                 "BatchSize y timeout deben ser positivos.");
         }
 
-        return new(mode, source, batchSize, timeout, forceImport, encoding, delimiter);
+        return new(mode, source, batchSize, timeout, forceImport, overwriteAll, encoding, delimiter);
     }
 
     private static string ReadValue(string[] args, ref int index)
@@ -163,11 +168,13 @@ internal static class Program
             Console.WriteLine(
                 $"Tablas creadas:                   {result.Tables.Count(table => table.SchemaStatus == SchemaStatus.Created)}");
             Console.WriteLine(
+                $"Tablas sobrescritas:              {result.Tables.Count(table => table.SchemaStatus == SchemaStatus.Replaced)}");
+            Console.WriteLine(
+                $"Tablas conservadas:               {result.Tables.Count(table => table.Status == ImportStatus.SkippedByUser)}");
+            Console.WriteLine(
                 $"Datos importados:                 {result.Tables.Count(table => table.DataStatus == DataStatus.Imported)}");
             Console.WriteLine(
                 $"Datos no disponibles:             {result.Tables.Count(table => table.DataStatus == DataStatus.NotAvailable)}");
-            Console.WriteLine(
-                $"Datos ya importados:              {result.Tables.Count(table => table.DataStatus == DataStatus.AlreadyImported)}");
             Console.WriteLine(
                 $"Filas importadas:                 {result.Tables.Sum(table => table.ImportedRowCount)}");
         }
@@ -183,6 +190,7 @@ internal static class Program
         int BatchSize,
         int CommandTimeoutSeconds,
         bool ForceImport,
+        bool OverwriteAll,
         string DefaultEncoding,
         string Delimiter);
 }

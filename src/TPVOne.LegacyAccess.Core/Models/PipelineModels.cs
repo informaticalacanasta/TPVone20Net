@@ -3,6 +3,7 @@ namespace TPVOne.LegacyAccess.Core.Models;
 public enum SchemaStatus
 {
     Created,
+    Replaced,
     AlreadyExists,
     Compatible,
     Conflict,
@@ -34,6 +35,7 @@ public enum ImportStatus
     Success,
     CompletedWithErrors,
     SkippedAlreadyImported,
+    SkippedByUser,
     Conflict,
     Failed
 }
@@ -44,6 +46,7 @@ public sealed class LegacyImportOptions
     public int BatchSize { get; set; } = 5000;
     public int CommandTimeoutSeconds { get; set; } = 120;
     public bool ForceImport { get; set; }
+    public bool OverwriteAll { get; set; }
     public string DefaultEncoding { get; set; } = "windows-1252";
     public string Delimiter { get; set; } = "|";
 }
@@ -123,7 +126,8 @@ public sealed record PipelineResult(
         Analysis.All(item => item.Error is null && item.DataError is null) &&
         Tables.All(table => table.Status is
             ImportStatus.Success or
-            ImportStatus.SkippedAlreadyImported) &&
+            ImportStatus.SkippedAlreadyImported or
+            ImportStatus.SkippedByUser) &&
         Plan.All(table => table.Status is not (
             PlannedTableStatus.Failed or
             PlannedTableStatus.Conflict or

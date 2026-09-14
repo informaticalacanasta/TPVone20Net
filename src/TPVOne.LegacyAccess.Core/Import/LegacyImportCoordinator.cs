@@ -18,6 +18,7 @@ public sealed class LegacyImportCoordinator
     private readonly ILegacyDataCopyPort? _dataCopy;
     private readonly ILegacyImportHistoryPort? _history;
     private readonly LegacyImportOptions _options;
+    private readonly ILegacyImportInteraction _interaction;
 
     public LegacyImportCoordinator(
         ILegacyTableSourceScanner scanner,
@@ -26,7 +27,8 @@ public sealed class LegacyImportCoordinator
         ILegacySqlSchemaPort? sql,
         ILegacyDataCopyPort? dataCopy,
         ILegacyImportHistoryPort? history,
-        LegacyImportOptions options)
+        LegacyImportOptions options,
+        ILegacyImportInteraction? interaction = null)
     {
         _scanner = scanner;
         _typeMapper = typeMapper;
@@ -35,6 +37,7 @@ public sealed class LegacyImportCoordinator
         _dataCopy = dataCopy;
         _history = history;
         _options = options;
+        _interaction = interaction ?? NullLegacyImportInteraction.Instance;
     }
 
     public async Task<PipelineResult> AnalyzeAsync(CancellationToken cancellationToken = default)
@@ -227,55 +230,178 @@ public sealed class LegacyImportCoordinator
         LegacyAnalysisItem analysis,
         CancellationToken cancellationToken)
     {
+        _interaction.Inform($"Analizando {analysis.LogicalName}...");
+
         var schema = await source.SchemaSource.ReadSchemaAsync(cancellationToken);
         foreach (var column in schema.Columns)
         {
             _typeMapper.Map(column);
         }
 
+        if (ProtectedInfrastructureTables.Contains(schema.Name))
+        {
+            var error =
+                $"La tabla '{schema.Name}' es de infraestructura interna y no puede " +
+                "crearse ni sobrescribirse desde archivos TXT/CSV.";
+            return await RecordAsync(
+                source,
+                analysis,
+                SchemaStatus.Failed,
+                DataStatus.NotProcessed,
+                ImportStatus.Failed,
+                created: false,
+                imported: 0,
+                previousRows: null,
+                error,
+                cancellationToken);
+        }
+
         var exists = await _sql!.TableExistsAsync(schema.Name, cancellationToken);
         long? previousRows = exists
             ? await _sql.CountRowsAsync(schema.Name, cancellationToken)
             : null;
-        SchemaStatus schemaStatus;
-        var created = false;
+
+        var dataError = analysis.DataError;
+        if (source.DataSource is not null && dataError is null)
+        {
+            try
+            {
+                CsvHeaderValidator.EnsureMatches(source.DataSource.ReadHeader(), schema);
+            }
+            catch (CsvHeaderMismatchException exception)
+            {
+                dataError = exception.Message;
+            }
+        }
 
         if (!exists)
         {
+            _interaction.Inform($"La tabla '{schema.Name}' no existe. Creando...");
             await _sql.CreateTableAsync(schema, cancellationToken);
             await _sql.CreateIndexesAsync(schema, cancellationToken);
-            schemaStatus = SchemaStatus.Created;
-            created = true;
+            return await ImportDataIfAvailableAsync(
+                source,
+                analysis,
+                schema,
+                SchemaStatus.Created,
+                created: true,
+                previousRows,
+                dataError,
+                cancellationToken);
         }
-        else
+
+        if (source.DataSource is null)
         {
-            var sqlSchema = await _sql.ReadTableSchemaAsync(schema.Name, cancellationToken);
-            var differences = _comparison.Compare(schema, sqlSchema);
-            if (differences.Any(difference => difference.BlocksImport))
-            {
-                var message = string.Join(
-                    " ",
-                    differences.Where(difference => difference.BlocksImport).Select(difference => difference.Message));
-                return await RecordAsync(
-                    source,
-                    analysis,
-                    SchemaStatus.Conflict,
-                    DataStatus.NotProcessed,
-                    ImportStatus.Conflict,
-                    created: false,
-                    imported: 0,
-                    previousRows,
-                    message,
-                    cancellationToken);
-            }
-
-            await _sql.CreateIndexesAsync(schema, cancellationToken);
-            schemaStatus = differences.Any(difference =>
-                difference.Kind is SchemaDifferenceKind.ExactMatch)
-                ? SchemaStatus.AlreadyExists
-                : SchemaStatus.Compatible;
+            return await HandleExistingSchemaOnlyAsync(
+                source,
+                analysis,
+                schema,
+                previousRows,
+                cancellationToken);
         }
 
+        if (dataError is not null)
+        {
+            return await RecordAsync(
+                source,
+                analysis,
+                SchemaStatus.AlreadyExists,
+                DataStatus.Failed,
+                ImportStatus.Failed,
+                created: false,
+                imported: 0,
+                previousRows,
+                dataError,
+                cancellationToken);
+        }
+
+        if (!_interaction.ConfirmOverwrite(schema.Name))
+        {
+            _interaction.Inform(OverwriteConfirmationProtocol.Conserved(schema.Name));
+            return await RecordAsync(
+                source,
+                analysis,
+                SchemaStatus.AlreadyExists,
+                DataStatus.NotProcessed,
+                ImportStatus.SkippedByUser,
+                created: false,
+                imported: 0,
+                previousRows,
+                error: null,
+                cancellationToken);
+        }
+
+        _interaction.Inform($"Eliminando tabla '{schema.Name}'...");
+        await _sql.DropTableAsync(schema.Name, cancellationToken);
+        _interaction.Inform($"Creando tabla '{schema.Name}'...");
+        await _sql.CreateTableAsync(schema, cancellationToken);
+        await _sql.CreateIndexesAsync(schema, cancellationToken);
+        return await ImportDataIfAvailableAsync(
+            source,
+            analysis,
+            schema,
+            SchemaStatus.Replaced,
+            created: true,
+            previousRows,
+            dataError: null,
+            cancellationToken);
+    }
+
+    private async Task<TableImportResult> HandleExistingSchemaOnlyAsync(
+        LegacyTableSource source,
+        LegacyAnalysisItem analysis,
+        LegacyTableSchema schema,
+        long? previousRows,
+        CancellationToken cancellationToken)
+    {
+        var sqlSchema = await _sql!.ReadTableSchemaAsync(schema.Name, cancellationToken);
+        var differences = _comparison.Compare(schema, sqlSchema);
+        if (differences.Any(difference => difference.BlocksImport))
+        {
+            var message = string.Join(
+                " ",
+                differences.Where(difference => difference.BlocksImport).Select(difference => difference.Message));
+            return await RecordAsync(
+                source,
+                analysis,
+                SchemaStatus.Conflict,
+                DataStatus.NotProcessed,
+                ImportStatus.Conflict,
+                created: false,
+                imported: 0,
+                previousRows,
+                message,
+                cancellationToken);
+        }
+
+        await _sql.CreateIndexesAsync(schema, cancellationToken);
+        var schemaStatus = differences.Any(difference =>
+            difference.Kind is SchemaDifferenceKind.ExactMatch)
+            ? SchemaStatus.AlreadyExists
+            : SchemaStatus.Compatible;
+        return await RecordAsync(
+            source,
+            analysis with { AvailableRecords = 0 },
+            schemaStatus,
+            DataStatus.NotAvailable,
+            ImportStatus.Success,
+            created: false,
+            imported: 0,
+            previousRows,
+            error: null,
+            cancellationToken);
+    }
+
+    private async Task<TableImportResult> ImportDataIfAvailableAsync(
+        LegacyTableSource source,
+        LegacyAnalysisItem analysis,
+        LegacyTableSchema schema,
+        SchemaStatus schemaStatus,
+        bool created,
+        long? previousRows,
+        string? dataError,
+        CancellationToken cancellationToken)
+    {
         if (source.DataSource is null)
         {
             return await RecordAsync(
@@ -291,7 +417,7 @@ public sealed class LegacyImportCoordinator
                 cancellationToken);
         }
 
-        if (analysis.DataError is not null)
+        if (dataError is not null)
         {
             return await RecordAsync(
                 source,
@@ -302,64 +428,12 @@ public sealed class LegacyImportCoordinator
                 created,
                 imported: 0,
                 previousRows,
-                analysis.DataError,
+                dataError,
                 cancellationToken);
         }
 
-        var header = source.DataSource.ReadHeader();
-        try
-        {
-            CsvHeaderValidator.EnsureMatches(header, schema);
-        }
-        catch (CsvHeaderMismatchException exception)
-        {
-            return await RecordAsync(
-                source,
-                analysis,
-                schemaStatus,
-                DataStatus.Failed,
-                ImportStatus.Failed,
-                created,
-                imported: 0,
-                previousRows,
-                exception.Message,
-                cancellationToken);
-        }
-
-        var dataHash = analysis.DataHash
-            ?? FileHashCalculator.CalculateSha256(source.DataSource.Location);
-        if (!_options.ForceImport &&
-            await _history!.WasDataImportedAsync(schema.Name, dataHash, cancellationToken))
-        {
-            return await RecordAsync(
-                source,
-                analysis,
-                schemaStatus,
-                DataStatus.AlreadyImported,
-                ImportStatus.SkippedAlreadyImported,
-                created,
-                imported: 0,
-                previousRows,
-                error: null,
-                cancellationToken);
-        }
-
-        var currentRows = await _sql.CountRowsAsync(schema.Name, cancellationToken);
-        if (currentRows != 0)
-        {
-            return await RecordAsync(
-                source,
-                analysis,
-                schemaStatus,
-                DataStatus.Failed,
-                ImportStatus.Failed,
-                created,
-                imported: 0,
-                previousRows,
-                $"La tabla '{schema.Name}' no está vacía. No se truncará ni se duplicarán filas.",
-                cancellationToken);
-        }
-
+        var csvName = Path.GetFileName(source.DataSource.Location);
+        _interaction.Inform($"Importando {csvName}...");
         try
         {
             var expected = source.DataSource.CountRecords();
@@ -369,6 +443,7 @@ public sealed class LegacyImportCoordinator
                 schema.Name,
                 expected,
                 cancellationToken);
+            _interaction.Inform($"{imported} registros importados.");
             return await RecordAsync(
                 source,
                 analysis with { AvailableRecords = expected },
@@ -443,5 +518,20 @@ public sealed class LegacyImportCoordinator
         }
 
         return current.Message;
+    }
+
+    private sealed class NullLegacyImportInteraction : ILegacyImportInteraction
+    {
+        public static readonly NullLegacyImportInteraction Instance = new();
+
+        public void Inform(string message)
+        {
+        }
+
+        public bool ConfirmOverwrite(string tableName)
+        {
+            throw new InvalidOperationException(
+                $"Se pidió confirmar la sobrescritura de '{tableName}' sin interacción configurada.");
+        }
     }
 }

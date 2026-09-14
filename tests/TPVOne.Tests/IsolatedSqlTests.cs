@@ -19,12 +19,8 @@ public sealed class IsolatedSqlTests
         "tiquetssii"
     ];
 
-    private static readonly string[] TechnicalTables =
-    [
-        "SchemaMigrations",
-        "LegacyImportHistory",
-        "LegacyAccessConversionHistory"
-    ];
+    private static readonly IReadOnlyList<string> TechnicalTables =
+        ProtectedInfrastructureTables.Names;
 
     [Fact]
     public void InitialSchema_DoesNotPrecreateLegacyTables()
@@ -81,52 +77,94 @@ public sealed class IsolatedSqlTests
     }
 
     [SqlFact]
-    public async Task IdenticalSecondImport_IsSkippedAlreadyImported()
+    public async Task SchemaOnlySecondRun_DoesNotDropExistingTable()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateSchemaOnly();
+        await ImportAsync(database, source.Path);
+
+        var second = await ImportAsync(database, source.Path);
+        var tables = await database.ListUserTablesAsync();
+
+        Assert.Equal(SchemaStatus.AlreadyExists, second.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.NotAvailable, second.Tables[0].DataStatus);
+        Assert.Contains("alergenos", tables, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("SchemaMigrations", tables, StringComparer.OrdinalIgnoreCase);
+    }
+
+    [SqlFact]
+    public async Task InvalidCsvHeader_DoesNotDropExistingTable()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+        File.WriteAllText(
+            Path.Combine(source.Path, "alergenos.csv"),
+            "id_alergeno|OTRO|\n1|x|\n");
+
+        var failed = await ImportAsync(database, source.Path);
+        var rows = await database.CountRowsAsync("alergenos");
+        var tables = await database.ListUserTablesAsync();
+
+        Assert.Equal(DataStatus.Failed, failed.Tables[0].DataStatus);
+        Assert.Equal(2, rows);
+        Assert.Contains("alergenos", tables, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("cabecera", failed.Tables[0].Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [SqlFact]
+    public async Task IdenticalSecondImport_DeclineKeepsExistingRows()
     {
         await using var database = await IsolatedSqlDatabase.CreateAsync();
         using var source = AlergenosFixture.CreateWithCsv();
 
         var first = await ImportAsync(database, source.Path);
-        var second = await ImportAsync(database, source.Path);
+        var second = await ImportAsync(database, source.Path, ScriptedOverwrite.With(false));
         var rows = await database.CountRowsAsync("alergenos");
         var history = await database.ReadHistoryStatusesAsync("alergenos");
 
         Assert.Equal(ImportStatus.Success, first.Tables[0].Status);
         Assert.Equal(DataStatus.Imported, first.Tables[0].DataStatus);
         Assert.Equal(2, first.Tables[0].ImportedRowCount);
-        Assert.Equal(ImportStatus.SkippedAlreadyImported, second.Tables[0].Status);
-        Assert.Equal(DataStatus.AlreadyImported, second.Tables[0].DataStatus);
+        Assert.Equal(ImportStatus.SkippedByUser, second.Tables[0].Status);
+        Assert.Equal(DataStatus.NotProcessed, second.Tables[0].DataStatus);
         Assert.Equal(0, second.Tables[0].ImportedRowCount);
         Assert.Equal(2, rows);
         Assert.Equal(
-            ["Success", "SkippedAlreadyImported"],
+            ["Success", "SkippedByUser"],
             history);
     }
 
     [SqlFact]
-    public async Task ForceImport_DoesNotTruncateExistingRows()
+    public async Task ExistingRows_OverwriteDropsAndReimports()
     {
         await using var database = await IsolatedSqlDatabase.CreateAsync();
         using var source = AlergenosFixture.CreateWithCsv();
         await ImportAsync(database, source.Path);
+        await database.ExecuteAsync(
+            "INSERT INTO dbo.alergenos (id_alergeno, DESCRIPCIO) VALUES (99, N'EXTRA');");
 
-        var forced = await ImportAsync(database, source.Path, forceImport: true);
+        var overwritten = await ImportAsync(database, source.Path, ScriptedOverwrite.With(true));
         var rows = await database.CountRowsAsync("alergenos");
+        var history = await database.ReadHistoryStatusesAsync("alergenos");
 
-        Assert.Equal(DataStatus.Failed, forced.Tables[0].DataStatus);
+        Assert.Equal(SchemaStatus.Replaced, overwritten.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.Imported, overwritten.Tables[0].DataStatus);
+        Assert.Equal(2, overwritten.Tables[0].ImportedRowCount);
         Assert.Equal(2, rows);
-        Assert.Contains("no está vacía", forced.Tables[0].Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(
+            ["Success", "Success"],
+            history);
     }
 
     private static async Task<PipelineResult> ImportAsync(
         IsolatedSqlDatabase database,
         string sourceDirectory,
-        bool forceImport = false)
+        ILegacyImportInteraction? interaction = null)
     {
         var options = new LegacyImportOptions
         {
-            SourceDirectory = sourceDirectory,
-            ForceImport = forceImport
+            SourceDirectory = sourceDirectory
         };
         var mapper = new DaoToSqlTypeMapper();
         var schema = new SqlServerSchemaService(database.ConnectionString, mapper, 30);
@@ -139,7 +177,8 @@ public sealed class IsolatedSqlTests
             schema,
             bulk,
             history,
-            options);
+            options,
+            interaction ?? ScriptedOverwrite.Unexpected());
         return await coordinator.ImportAsync();
     }
 
@@ -191,6 +230,43 @@ file static class AlergenosFixture
             Path.Combine(directory.Path, "alergenos.csv"),
             "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|GLUTEN||\n2|HUEVOS||\n");
         return directory;
+    }
+}
+
+file sealed class ScriptedOverwrite : ILegacyImportInteraction
+{
+    private readonly Queue<bool> _answers;
+    private readonly bool _throwIfAsked;
+
+    private ScriptedOverwrite(bool throwIfAsked, params bool[] answers)
+    {
+        _throwIfAsked = throwIfAsked;
+        _answers = new Queue<bool>(answers);
+    }
+
+    public static ScriptedOverwrite Unexpected()
+    {
+        return new(throwIfAsked: true);
+    }
+
+    public static ScriptedOverwrite With(params bool[] answers)
+    {
+        return new(throwIfAsked: false, answers);
+    }
+
+    public void Inform(string message)
+    {
+    }
+
+    public bool ConfirmOverwrite(string tableName)
+    {
+        if (_throwIfAsked || _answers.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"No se esperaba confirmación para '{tableName}'.");
+        }
+
+        return _answers.Dequeue();
     }
 }
 
@@ -309,6 +385,14 @@ internal sealed class IsolatedSqlDatabase : IAsyncDisposable
             $"SELECT COUNT_BIG(*) FROM dbo.[{tableName.Replace("]", "]]", StringComparison.Ordinal)}];",
             connection);
         return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    public async Task ExecuteAsync(string sql)
+    {
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync();
     }
 
     public async Task<IReadOnlyList<string>> ReadHistoryStatusesAsync(string tableName)

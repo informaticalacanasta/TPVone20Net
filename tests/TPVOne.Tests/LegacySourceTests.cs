@@ -190,6 +190,28 @@ public sealed class LegacySourceTests
     }
 
     [Fact]
+    public async Task MissingSqlTable_CreatesAndImportsCsv()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
+        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "id|nombre|\n1|pan|\n");
+        var sql = new FakeSql();
+        var copy = new FakeCopy();
+        var interaction = FakeInteraction.Unexpected();
+        var result = await Import(directory.Path, sql, copy, interaction: interaction);
+
+        Assert.Empty(interaction.AskedTables);
+        Assert.Empty(sql.Dropped);
+        Assert.Equal(1, sql.CreateCalls);
+        Assert.Equal(1, copy.Calls);
+        Assert.Contains("productos", sql.IndexedTables);
+        Assert.Equal(SchemaStatus.Created, result.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.Imported, result.Tables[0].DataStatus);
+        Assert.Equal(1, result.Tables[0].ImportedRowCount);
+        Assert.True(result.IsSuccessful);
+    }
+
+    [Fact]
     public void CsvHeader_IgnoresTrailingEmptyField()
     {
         using var directory = new TempDir();
@@ -315,7 +337,7 @@ public sealed class LegacySourceTests
     }
 
     [Fact]
-    public async Task CsvAppearsLater_IsImportedWithoutRecreatingSchema()
+    public async Task CsvAppearsLater_AsksOverwriteAndRecreatesWhenAccepted()
     {
         using var directory = new TempDir();
         File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
@@ -330,15 +352,18 @@ public sealed class LegacySourceTests
             "id|nombre|\n1|pan|\n");
         sql.Existing["productos"] = ToSql(sql.Created["productos"]);
         sql.Created.Clear();
-        await Import(directory.Path, sql, copy);
+        var interaction = FakeInteraction.With(true);
+        await Import(directory.Path, sql, copy, interaction: interaction);
 
-        Assert.Equal(1, sql.CreateCalls);
+        Assert.Equal(["productos"], interaction.AskedTables);
+        Assert.Equal(["productos"], sql.Dropped);
+        Assert.Equal(2, sql.CreateCalls);
         Assert.Equal(1, copy.Calls);
-        Assert.Equal(SchemaStatus.AlreadyExists, copy.LastResult?.SchemaStatus ?? SchemaStatus.AlreadyExists);
+        Assert.Equal(SchemaStatus.Replaced, copy.LastResult?.SchemaStatus);
     }
 
     [Fact]
-    public async Task SameCsvSecondRun_IsSkipped()
+    public async Task ExistingTable_UserDeclinesOverwrite_KeepsTable()
     {
         using var directory = new TempDir();
         File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
@@ -348,34 +373,26 @@ public sealed class LegacySourceTests
         var history = new FakeHistory();
         var first = await Import(directory.Path, sql, copy, history);
         sql.Existing["productos"] = ToSql(sql.Created["productos"]);
-        var second = await Import(directory.Path, sql, copy, history);
+        sql.RowCounts["productos"] = 1;
+        var interaction = FakeInteraction.With(false);
+        var second = await Import(directory.Path, sql, copy, history, interaction);
 
         Assert.Equal(DataStatus.Imported, first.Tables[0].DataStatus);
-        Assert.Equal(DataStatus.AlreadyImported, second.Tables[0].DataStatus);
-        Assert.Equal(ImportStatus.SkippedAlreadyImported, second.Tables[0].Status);
+        Assert.Equal(["productos"], interaction.AskedTables);
+        Assert.Empty(sql.Dropped);
+        Assert.Equal(1, sql.CreateCalls);
         Assert.Equal(1, copy.Calls);
+        Assert.Equal(SchemaStatus.AlreadyExists, second.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.NotProcessed, second.Tables[0].DataStatus);
+        Assert.Equal(ImportStatus.SkippedByUser, second.Tables[0].Status);
+        Assert.Contains(
+            interaction.Messages,
+            message => message.Contains("Se conserva la tabla 'productos'", StringComparison.Ordinal));
+        Assert.True(second.IsSuccessful);
     }
 
     [Fact]
-    public async Task ForceImport_DoesNotSkipAlreadyImportedWhenTableIsEmpty()
-    {
-        using var directory = new TempDir();
-        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
-        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "id|nombre|\n1|pan|\n");
-        var sql = new FakeSql();
-        var copy = new FakeCopy();
-        var history = new FakeHistory();
-        await Import(directory.Path, sql, copy, history);
-        sql.Existing["productos"] = ToSql(sql.Created["productos"]);
-
-        var forced = await Import(directory.Path, sql, copy, history, forceImport: true);
-
-        Assert.Equal(2, copy.Calls);
-        Assert.Equal(DataStatus.Imported, forced.Tables[0].DataStatus);
-    }
-
-    [Fact]
-    public async Task ForceImport_DoesNotTruncateWhenTableHasRows()
+    public async Task ExistingTable_UserAcceptsOverwrite_DropsCreatesAndImports()
     {
         using var directory = new TempDir();
         File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
@@ -386,12 +403,194 @@ public sealed class LegacySourceTests
         await Import(directory.Path, sql, copy, history);
         sql.Existing["productos"] = ToSql(sql.Created["productos"]);
         sql.RowCounts["productos"] = 1;
+        var interaction = FakeInteraction.With(true);
+        var overwritten = await Import(directory.Path, sql, copy, history, interaction);
 
-        var forced = await Import(directory.Path, sql, copy, history, forceImport: true);
+        Assert.Equal(["productos"], sql.Dropped);
+        Assert.Equal(2, sql.CreateCalls);
+        Assert.Equal(2, copy.Calls);
+        Assert.Equal(SchemaStatus.Replaced, overwritten.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.Imported, overwritten.Tables[0].DataStatus);
+        Assert.Equal(ImportStatus.Success, overwritten.Tables[0].Status);
+        Assert.Equal(0, sql.RowCounts["productos"]);
+    }
 
+    [Fact]
+    public async Task ExistingTable_SameHashOverwrite_StillImports()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
+        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "id|nombre|\n1|pan|\n");
+        var sql = new FakeSql();
+        var copy = new FakeCopy();
+        var history = new FakeHistory();
+        await Import(directory.Path, sql, copy, history);
+        sql.Existing["productos"] = ToSql(sql.Created["productos"]);
+        sql.RowCounts["productos"] = 1;
+        Assert.True(await history.WasDataImportedAsync(
+            "productos",
+            FileHashCalculator.CalculateSha256(Path.Combine(directory.Path, "productos.csv")),
+            CancellationToken.None));
+
+        var overwritten = await Import(
+            directory.Path,
+            sql,
+            copy,
+            history,
+            FakeInteraction.With(true));
+
+        Assert.Equal(2, copy.Calls);
+        Assert.Equal(DataStatus.Imported, overwritten.Tables[0].DataStatus);
+        Assert.Equal(SchemaStatus.Replaced, overwritten.Tables[0].SchemaStatus);
+    }
+
+    [Fact]
+    public async Task ExistingIncompatibleSchema_OverwriteRecreatesFromTxt()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        File.WriteAllText(
+            Path.Combine(directory.Path, "alergenos.csv"),
+            "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|GLUTEN||\n");
+        var sql = new FakeSql
+        {
+            Existing =
+            {
+                ["alergenos"] = new SqlTableSchema(
+                    "alergenos",
+                    [
+                        new("id_alergeno", new("int"), true, false, 0),
+                        new("DESCRIPCIO", new("int"), true, false, 1)
+                    ],
+                    [])
+            },
+            RowCounts = { ["alergenos"] = 8 }
+        };
+        var copy = new FakeCopy();
+        var result = await Import(
+            directory.Path,
+            sql,
+            copy,
+            interaction: FakeInteraction.With(true));
+
+        Assert.False(sql.Compared);
+        Assert.Equal(["alergenos"], sql.Dropped);
+        Assert.Equal(1, sql.CreateCalls);
         Assert.Equal(1, copy.Calls);
-        Assert.Equal(DataStatus.Failed, forced.Tables[0].DataStatus);
-        Assert.Contains("no está vacía", forced.Tables[0].Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(SchemaStatus.Replaced, result.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.Imported, result.Tables[0].DataStatus);
+        Assert.Equal(3, sql.Created["alergenos"].Columns.Count);
+    }
+
+    [Fact]
+    public async Task ExistingIncompatibleSchema_DeclineKeepsOriginal()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        File.WriteAllText(
+            Path.Combine(directory.Path, "alergenos.csv"),
+            "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|GLUTEN||\n");
+        var original = new SqlTableSchema(
+            "alergenos",
+            [
+                new("id_alergeno", new("int"), true, false, 0),
+                new("DESCRIPCIO", new("int"), true, false, 1)
+            ],
+            []);
+        var sql = new FakeSql
+        {
+            Existing = { ["alergenos"] = original },
+            RowCounts = { ["alergenos"] = 8 }
+        };
+        var copy = new FakeCopy();
+        var result = await Import(
+            directory.Path,
+            sql,
+            copy,
+            interaction: FakeInteraction.With(false));
+
+        Assert.Empty(sql.Dropped);
+        Assert.Equal(0, sql.CreateCalls);
+        Assert.Equal(0, copy.Calls);
+        Assert.False(sql.Compared);
+        Assert.Equal(original, sql.Existing["alergenos"]);
+        Assert.Equal(8, sql.RowCounts["alergenos"]);
+        Assert.Equal(ImportStatus.SkippedByUser, result.Tables[0].Status);
+    }
+
+    [Fact]
+    public async Task ExistingTable_MissingCsv_DoesNotAskOrDrop()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "alergenos.txt"), AlergenosTxt);
+        var schema = _parser.Parse(AlergenosTxt);
+        var interaction = FakeInteraction.Unexpected();
+        var sql = new FakeSql
+        {
+            Existing = { ["alergenos"] = ToSql(schema) },
+            RowCounts = { ["alergenos"] = 4 }
+        };
+        var copy = new FakeCopy();
+        var result = await Import(directory.Path, sql, copy, interaction: interaction);
+
+        Assert.Empty(interaction.AskedTables);
+        Assert.Empty(sql.Dropped);
+        Assert.Equal(0, copy.Calls);
+        Assert.Equal(DataStatus.NotAvailable, result.Tables[0].DataStatus);
+        Assert.Equal(4, sql.RowCounts["alergenos"]);
+    }
+
+    [Fact]
+    public async Task ExistingTable_InvalidCsvHeader_DoesNotAskOrDrop()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(Path.Combine(directory.Path, "productos.txt"), TableTxt("productos"));
+        File.WriteAllText(Path.Combine(directory.Path, "productos.csv"), "id|otro|\n1|x|\n");
+        var sql = new FakeSql
+        {
+            Existing = { ["productos"] = ToSql(_parser.Parse(TableTxt("productos"))) },
+            RowCounts = { ["productos"] = 3 }
+        };
+        var interaction = FakeInteraction.Unexpected();
+        var copy = new FakeCopy();
+        var result = await Import(directory.Path, sql, copy, interaction: interaction);
+
+        Assert.Empty(interaction.AskedTables);
+        Assert.Empty(sql.Dropped);
+        Assert.Equal(0, copy.Calls);
+        Assert.Equal(DataStatus.Failed, result.Tables[0].DataStatus);
+        Assert.Equal(3, sql.RowCounts["productos"]);
+        Assert.Contains("cabecera", result.Tables[0].Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ProtectedInfrastructureTable_IsNotDropped()
+    {
+        using var directory = new TempDir();
+        File.WriteAllText(
+            Path.Combine(directory.Path, "SchemaMigrations.txt"),
+            TableTxt("SchemaMigrations"));
+        File.WriteAllText(
+            Path.Combine(directory.Path, "SchemaMigrations.csv"),
+            "id|nombre|\n1|x|\n");
+        var interaction = FakeInteraction.Unexpected();
+        var sql = new FakeSql
+        {
+            Existing =
+            {
+                ["SchemaMigrations"] = ToSql(_parser.Parse(TableTxt("SchemaMigrations")))
+            },
+            RowCounts = { ["SchemaMigrations"] = 5 }
+        };
+        var copy = new FakeCopy();
+        var result = await Import(directory.Path, sql, copy, interaction: interaction);
+
+        Assert.Empty(interaction.AskedTables);
+        Assert.Empty(sql.Dropped);
+        Assert.Equal(0, copy.Calls);
+        Assert.Equal(SchemaStatus.Failed, result.Tables[0].SchemaStatus);
+        Assert.Contains("infraestructura interna", result.Tables[0].Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(5, sql.RowCounts["SchemaMigrations"]);
     }
 
     [Fact]
@@ -466,12 +665,11 @@ public sealed class LegacySourceTests
         FakeSql sql,
         FakeCopy copy,
         FakeHistory? history = null,
-        bool forceImport = false)
+        ILegacyImportInteraction? interaction = null)
     {
         var options = new LegacyImportOptions
         {
-            SourceDirectory = sourceDirectory,
-            ForceImport = forceImport
+            SourceDirectory = sourceDirectory
         };
         var mapper = new DaoToSqlTypeMapper();
         copy.History = history ?? new FakeHistory();
@@ -483,7 +681,8 @@ public sealed class LegacySourceTests
             sql,
             copy,
             copy.History,
-            options);
+            options,
+            interaction ?? FakeInteraction.Unexpected());
     }
 
     private static async Task<PipelineResult> Import(
@@ -491,9 +690,9 @@ public sealed class LegacySourceTests
         FakeSql sql,
         FakeCopy copy,
         FakeHistory? history = null,
-        bool forceImport = false)
+        ILegacyImportInteraction? interaction = null)
     {
-        var coordinator = Coordinator(sourceDirectory, sql, copy, history, forceImport);
+        var coordinator = Coordinator(sourceDirectory, sql, copy, history, interaction);
         var result = await coordinator.ImportAsync();
         copy.LastResult = result.Tables.LastOrDefault();
         return result;
@@ -550,12 +749,56 @@ public sealed class LegacySourceTests
         return data;
     }
 
+    private sealed class FakeInteraction : ILegacyImportInteraction
+    {
+        private readonly Queue<bool> _answers;
+        private readonly bool _throwIfAsked;
+
+        private FakeInteraction(bool throwIfAsked, params bool[] answers)
+        {
+            _throwIfAsked = throwIfAsked;
+            _answers = new Queue<bool>(answers);
+        }
+
+        public List<string> Messages { get; } = [];
+
+        public List<string> AskedTables { get; } = [];
+
+        public static FakeInteraction Unexpected()
+        {
+            return new(throwIfAsked: true);
+        }
+
+        public static FakeInteraction With(params bool[] answers)
+        {
+            return new(throwIfAsked: false, answers);
+        }
+
+        public void Inform(string message)
+        {
+            Messages.Add(message);
+        }
+
+        public bool ConfirmOverwrite(string tableName)
+        {
+            AskedTables.Add(tableName);
+            if (_throwIfAsked || _answers.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"No se esperaba confirmación para '{tableName}'.");
+            }
+
+            return _answers.Dequeue();
+        }
+    }
+
     private sealed class FakeSql : ILegacySqlSchemaPort
     {
         public Dictionary<string, LegacyTableSchema> Created { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, SqlTableSchema> Existing { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> IndexedTables { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, long> RowCounts { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<string> Dropped { get; } = [];
         public int CreateCalls { get; private set; }
         public bool Compared { get; private set; }
 
@@ -564,10 +807,21 @@ public sealed class LegacySourceTests
             return Task.FromResult(Existing.ContainsKey(tableName) || Created.ContainsKey(tableName));
         }
 
+        public Task DropTableAsync(string tableName, CancellationToken cancellationToken)
+        {
+            Dropped.Add(tableName);
+            Existing.Remove(tableName);
+            Created.Remove(tableName);
+            IndexedTables.Remove(tableName);
+            RowCounts[tableName] = 0;
+            return Task.CompletedTask;
+        }
+
         public Task CreateTableAsync(LegacyTableSchema table, CancellationToken cancellationToken)
         {
             CreateCalls++;
             Created[table.Name] = table;
+            RowCounts[table.Name] = 0;
             return Task.CompletedTask;
         }
 

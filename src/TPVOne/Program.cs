@@ -50,6 +50,11 @@ internal static class Program
                 importOptions.SourceDirectory = command.SourceDirectory;
             }
 
+            if (command.OverwriteAll)
+            {
+                importOptions.OverwriteAll = true;
+            }
+
             if (command.Mode is null)
             {
                 var installerOnly = serviceProvider.GetRequiredService<DatabaseInstaller>();
@@ -94,11 +99,12 @@ internal static class Program
     {
         if (args.Length == 0)
         {
-            return new(null, null);
+            return new(null, null, false);
         }
 
         string? mode = null;
         string? source = null;
+        var overwriteAll = false;
         for (var index = 0; index < args.Length; index++)
         {
             switch (args[index])
@@ -110,6 +116,9 @@ internal static class Program
                 case "--import":
                 case "--import-access":
                     mode = "import";
+                    break;
+                case "--overwrite-all":
+                    overwriteAll = true;
                     break;
                 case "--source":
                     if (++index >= args.Length)
@@ -127,12 +136,12 @@ internal static class Program
                     }
 
                     throw new ArgumentException(
-                        "Uso: TPVOne [--analyze|--import] [--source carpeta]");
+                        "Uso: TPVOne [--analyze|--import] [--source carpeta] [--overwrite-all]");
             }
         }
 
-        return new(mode, source);
+        return new(mode, source, overwriteAll);
     }
 
-    private sealed record LegacyCommand(string? Mode, string? SourceDirectory);
+    private sealed record LegacyCommand(string? Mode, string? SourceDirectory, bool OverwriteAll);
 }

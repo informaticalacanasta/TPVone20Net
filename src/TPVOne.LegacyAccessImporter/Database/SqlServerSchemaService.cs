@@ -42,6 +42,25 @@ internal sealed class SqlServerSchemaService : ILegacySqlSchemaPort
         return Convert.ToBoolean(await command.ExecuteScalarAsync(cancellationToken));
     }
 
+    public async Task DropTableAsync(string tableName, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            IF OBJECT_ID(N'dbo.' + QUOTENAME(@TableName), N'U') IS NOT NULL
+            BEGIN
+                DECLARE @drop nvarchar(max) = N'DROP TABLE dbo.' + QUOTENAME(@TableName);
+                EXEC (@drop);
+            END
+            """;
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new SqlCommand(sql, connection)
+        {
+            CommandTimeout = _commandTimeout
+        };
+        command.Parameters.AddWithValue("@TableName", tableName);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public Task CreateTableAsync(
         LegacyTableSchema table,
         CancellationToken cancellationToken)
