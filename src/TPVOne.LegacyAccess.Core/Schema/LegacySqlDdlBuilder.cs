@@ -40,11 +40,13 @@ public sealed class LegacySqlDdlBuilder
 
     public IReadOnlyList<string> BuildCreateIndexSql(
         LegacyTableSchema table,
-        string destinationTableName)
+        string destinationTableName,
+        string? uniqueNameSuffix = null)
     {
         var statements = new List<string>();
         foreach (var index in table.Indexes)
         {
+            var indexName = LegacyStagingNames.SuffixedIndex(index.Name, uniqueNameSuffix);
             var columns = string.Join(
                 ", ",
                 index.Columns
@@ -57,7 +59,7 @@ public sealed class LegacySqlDdlBuilder
             {
                 statements.Add(
                     $"ALTER TABLE dbo.{SqlIdentifier.Quote(destinationTableName)} " +
-                    $"ADD CONSTRAINT {SqlIdentifier.Quote(index.Name)} PRIMARY KEY ({columns});");
+                    $"ADD CONSTRAINT {SqlIdentifier.Quote(indexName)} PRIMARY KEY ({columns});");
                 continue;
             }
 
@@ -66,7 +68,7 @@ public sealed class LegacySqlDdlBuilder
                 ? BuildUniqueNullFilter(table, index)
                 : null;
             statements.Add(
-                $"CREATE {unique}INDEX {SqlIdentifier.Quote(index.Name)} ON " +
+                $"CREATE {unique}INDEX {SqlIdentifier.Quote(indexName)} ON " +
                 $"dbo.{SqlIdentifier.Quote(destinationTableName)} ({columns})" +
                 $"{filter};");
         }

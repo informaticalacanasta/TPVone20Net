@@ -84,7 +84,7 @@ internal static class Program
         string? mode = null;
         string? source = null;
         var batchSize = 5000;
-        var timeout = 120;
+        var timeout = 600;
         var forceImport = false;
         var overwriteAll = false;
         var encoding = "windows-1252";

@@ -44,7 +44,7 @@ public sealed class LegacyImportOptions
 {
     public string SourceDirectory { get; set; } = string.Empty;
     public int BatchSize { get; set; } = 5000;
-    public int CommandTimeoutSeconds { get; set; } = 120;
+    public int CommandTimeoutSeconds { get; set; } = 600;
     public bool ForceImport { get; set; }
     public bool OverwriteAll { get; set; }
     public string DefaultEncoding { get; set; } = "windows-1252";

@@ -286,38 +286,12 @@ public sealed class LegacyImportCoordinator
             effectiveSchema = EffectiveLegacySchema.Apply(schema, kinds);
         }
 
-        if (!exists)
-        {
-            _interaction.Inform($"La tabla '{schema.Name}' no existe. Creando...");
-            await _sql.CreateTableAsync(effectiveSchema, cancellationToken);
-            await _sql.CreateIndexesAsync(effectiveSchema, cancellationToken);
-            return await ImportDataIfAvailableAsync(
-                source,
-                analysis,
-                effectiveSchema,
-                SchemaStatus.Created,
-                created: true,
-                previousRows,
-                dataError,
-                cancellationToken);
-        }
-
-        if (source.DataSource is null)
-        {
-            return await HandleExistingSchemaOnlyAsync(
-                source,
-                analysis,
-                schema,
-                previousRows,
-                cancellationToken);
-        }
-
         if (dataError is not null)
         {
             return await RecordAsync(
                 source,
                 analysis,
-                SchemaStatus.AlreadyExists,
+                exists ? SchemaStatus.AlreadyExists : SchemaStatus.Failed,
                 DataStatus.Failed,
                 ImportStatus.Failed,
                 created: false,
@@ -327,7 +301,60 @@ public sealed class LegacyImportCoordinator
                 cancellationToken);
         }
 
-        if (!_interaction.ConfirmOverwrite(schema.Name))
+        if (source.DataSource is null)
+        {
+            if (!exists)
+            {
+                _interaction.Inform($"La tabla '{schema.Name}' no existe. Creando...");
+                await _sql.CreateTableAsync(effectiveSchema, cancellationToken);
+                await _sql.CreateIndexesAsync(effectiveSchema, cancellationToken);
+                return await RecordAsync(
+                    source,
+                    analysis with { AvailableRecords = 0 },
+                    SchemaStatus.Created,
+                    DataStatus.NotAvailable,
+                    ImportStatus.Success,
+                    created: true,
+                    imported: 0,
+                    previousRows,
+                    error: null,
+                    cancellationToken);
+            }
+
+            return await HandleExistingSchemaOnlyAsync(
+                source,
+                analysis,
+                schema,
+                previousRows,
+                cancellationToken);
+        }
+
+        if (exists &&
+            analysis.DataHash is not null &&
+            ImportDeduplicationPolicy.ShouldSkipAlreadyImported(
+                await _history!.WasDataImportedAsync(
+                    schema.Name,
+                    analysis.DataHash,
+                    cancellationToken),
+                _options.ForceImport))
+        {
+            _interaction.Inform(
+                $"La tabla '{schema.Name}' ya fue importada previamente desde un origen " +
+                "con el mismo contenido. Se omite.");
+            return await RecordAsync(
+                source,
+                analysis,
+                SchemaStatus.AlreadyExists,
+                DataStatus.AlreadyImported,
+                ImportStatus.SkippedAlreadyImported,
+                created: false,
+                imported: 0,
+                previousRows,
+                error: null,
+                cancellationToken);
+        }
+
+        if (exists && !_interaction.ConfirmOverwrite(schema.Name))
         {
             _interaction.Inform(OverwriteConfirmationProtocol.Conserved(schema.Name));
             return await RecordAsync(
@@ -343,20 +370,80 @@ public sealed class LegacyImportCoordinator
                 cancellationToken);
         }
 
-        _interaction.Inform($"Eliminando tabla '{schema.Name}'...");
-        await _sql.DropTableAsync(schema.Name, cancellationToken);
-        _interaction.Inform($"Creando tabla '{schema.Name}'...");
-        await _sql.CreateTableAsync(effectiveSchema, cancellationToken);
-        await _sql.CreateIndexesAsync(effectiveSchema, cancellationToken);
-        return await ImportDataIfAvailableAsync(
+        return await ImportViaStagingAsync(
             source,
             analysis,
             effectiveSchema,
-            SchemaStatus.Replaced,
-            created: true,
+            exists,
             previousRows,
-            dataError: null,
             cancellationToken);
+    }
+
+    private async Task<TableImportResult> ImportViaStagingAsync(
+        LegacyTableSource source,
+        LegacyAnalysisItem analysis,
+        LegacyTableSchema schema,
+        bool destinationExisted,
+        long? previousRows,
+        CancellationToken cancellationToken)
+    {
+        var dataSource = source.DataSource
+            ?? throw new InvalidOperationException(
+                $"No hay CSV para importar '{schema.Name}'.");
+        var expected = dataSource.CountRecords();
+        var token = LegacyStagingNames.NewToken();
+        var stagingName = LegacyStagingNames.StagingTable(schema.Name, token);
+        var backupName = LegacyStagingNames.BackupTable(schema.Name, token);
+        var schemaWithRows = schema with { RowCount = expected };
+        _interaction.Inform(
+            destinationExisted
+                ? $"Importando '{schema.Name}'..."
+                : $"La tabla '{schema.Name}' no existe. Creando...");
+
+        var operations = new SqlReplacementOperations(
+            _sql!,
+            _dataCopy!,
+            dataSource,
+            schemaWithRows,
+            expected,
+            token,
+            _interaction);
+
+        try
+        {
+            var imported = await new SafeReplacementWorkflow().ReplaceOrCreateAsync(
+                operations,
+                schemaWithRows,
+                schema.Name,
+                stagingName,
+                backupName,
+                cancellationToken);
+            return await RecordAsync(
+                source,
+                analysis with { AvailableRecords = expected },
+                destinationExisted ? SchemaStatus.Replaced : SchemaStatus.Created,
+                DataStatus.Imported,
+                ImportStatus.Success,
+                created: true,
+                imported,
+                previousRows,
+                error: null,
+                cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            return await RecordAsync(
+                source,
+                analysis,
+                destinationExisted ? SchemaStatus.AlreadyExists : SchemaStatus.Failed,
+                DataStatus.Failed,
+                ImportStatus.Failed,
+                created: false,
+                imported: 0,
+                previousRows,
+                exception.Message,
+                CancellationToken.None);
+        }
     }
 
     private void InformBinaryClassification(
@@ -434,86 +521,6 @@ public sealed class LegacyImportCoordinator
             cancellationToken);
     }
 
-    private async Task<TableImportResult> ImportDataIfAvailableAsync(
-        LegacyTableSource source,
-        LegacyAnalysisItem analysis,
-        LegacyTableSchema schema,
-        SchemaStatus schemaStatus,
-        bool created,
-        long? previousRows,
-        string? dataError,
-        CancellationToken cancellationToken)
-    {
-        if (source.DataSource is null)
-        {
-            return await RecordAsync(
-                source,
-                analysis with { AvailableRecords = 0 },
-                schemaStatus,
-                DataStatus.NotAvailable,
-                ImportStatus.Success,
-                created,
-                imported: 0,
-                previousRows,
-                error: null,
-                cancellationToken);
-        }
-
-        if (dataError is not null)
-        {
-            return await RecordAsync(
-                source,
-                analysis,
-                schemaStatus,
-                DataStatus.Failed,
-                ImportStatus.Failed,
-                created,
-                imported: 0,
-                previousRows,
-                dataError,
-                cancellationToken);
-        }
-
-        var csvName = Path.GetFileName(source.DataSource.Location);
-        _interaction.Inform($"Importando {csvName}...");
-        try
-        {
-            var expected = source.DataSource.CountRecords();
-            var imported = await _dataCopy!.CopyAsync(
-                schema with { RowCount = expected },
-                source.DataSource,
-                schema.Name,
-                expected,
-                cancellationToken);
-            _interaction.Inform($"{imported} registros importados.");
-            return await RecordAsync(
-                source,
-                analysis with { AvailableRecords = expected },
-                schemaStatus,
-                DataStatus.Imported,
-                ImportStatus.Success,
-                created,
-                imported,
-                previousRows,
-                error: null,
-                cancellationToken);
-        }
-        catch (Exception exception)
-        {
-            return await RecordAsync(
-                source,
-                analysis,
-                schemaStatus,
-                DataStatus.Failed,
-                ImportStatus.Failed,
-                created,
-                imported: 0,
-                previousRows,
-                RootMessage(exception),
-                CancellationToken.None);
-        }
-    }
-
     private async Task<TableImportResult> RecordAsync(
         LegacyTableSource source,
         LegacyAnalysisItem analysis,
@@ -560,6 +567,134 @@ public sealed class LegacyImportCoordinator
         }
 
         return current.Message;
+    }
+
+    private sealed class SqlReplacementOperations : IReplacementOperations
+    {
+        private readonly ILegacySqlSchemaPort _sql;
+        private readonly ILegacyDataCopyPort _copy;
+        private readonly ILegacyDataSource _dataSource;
+        private readonly LegacyTableSchema _schema;
+        private readonly long _expectedRows;
+        private readonly string _indexSuffix;
+        private readonly ILegacyImportInteraction _interaction;
+
+        public SqlReplacementOperations(
+            ILegacySqlSchemaPort sql,
+            ILegacyDataCopyPort copy,
+            ILegacyDataSource dataSource,
+            LegacyTableSchema schema,
+            long expectedRows,
+            string indexSuffix,
+            ILegacyImportInteraction interaction)
+        {
+            _sql = sql;
+            _copy = copy;
+            _dataSource = dataSource;
+            _schema = schema;
+            _expectedRows = expectedRows;
+            _indexSuffix = indexSuffix;
+            _interaction = interaction;
+        }
+
+        public Task CreateEmptyTableAsync(
+            string tableName,
+            LegacyTableSchema schema,
+            CancellationToken cancellationToken)
+        {
+            return _sql.CreateTableAsync(schema, tableName, cancellationToken);
+        }
+
+        public async Task<long> CopyDataAsync(string tableName, CancellationToken cancellationToken)
+        {
+            _interaction.Inform($"Importando {Path.GetFileName(_dataSource.Location)}...");
+            var progress = new Progress<LegacyCopyProgress>(update =>
+                _interaction.Inform($"{update.RowsCopied} / {update.ExpectedRows}"));
+            try
+            {
+                var copied = await _copy.CopyAsync(
+                    _schema,
+                    _dataSource,
+                    tableName,
+                    _expectedRows,
+                    progress,
+                    cancellationToken);
+                _interaction.Inform($"{copied.RowsCopied} registros importados.");
+                return copied.RowsCopied;
+            }
+            catch (Exception exception) when (exception is not DataImportException
+                and not OperationCanceledException)
+            {
+                throw new DataImportException(
+                    $"Error importando datos en staging de '{_schema.Name}'.",
+                    exception);
+            }
+        }
+
+        public async Task CreateIndexesAsync(
+            string tableName,
+            LegacyTableSchema schema,
+            CancellationToken cancellationToken)
+        {
+            _interaction.Inform("Validando...");
+            _interaction.Inform("Creando índices...");
+            try
+            {
+                await _sql.CreateIndexesAsync(
+                    schema,
+                    tableName,
+                    _indexSuffix,
+                    cancellationToken);
+            }
+            catch (Exception exception) when (exception is not DataImportException)
+            {
+                throw new DataImportException(
+                    $"Error creando índices de '{schema.Name}'.",
+                    exception);
+            }
+        }
+
+        public Task<long> CountAsync(string tableName, CancellationToken cancellationToken)
+        {
+            return _sql.CountRowsAsync(tableName, cancellationToken);
+        }
+
+        public Task<bool> ExistsAsync(string tableName, CancellationToken cancellationToken)
+        {
+            return _sql.TableExistsAsync(tableName, cancellationToken);
+        }
+
+        public async Task SwapAtomicAsync(
+            string destinationTableName,
+            string stagingTableName,
+            string? backupTableName,
+            CancellationToken cancellationToken)
+        {
+            _interaction.Inform($"Sustituyendo tabla '{destinationTableName}'...");
+            try
+            {
+                await _sql.SwapAtomicAsync(
+                    destinationTableName,
+                    stagingTableName,
+                    backupTableName,
+                    _schema.Indexes,
+                    _indexSuffix,
+                    cancellationToken);
+            }
+            catch (Exception exception) when (exception is not DataImportException)
+            {
+                throw new DataImportException(
+                    $"Error sustituyendo tabla '{destinationTableName}'.",
+                    exception);
+            }
+
+            _interaction.Inform("Importación completada.");
+        }
+
+        public Task DropIfExistsAsync(string tableName, CancellationToken cancellationToken)
+        {
+            return _sql.DropTableAsync(tableName, cancellationToken);
+        }
     }
 
     private sealed class NullLegacyImportInteraction : ILegacyImportInteraction

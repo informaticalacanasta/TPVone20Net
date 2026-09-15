@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using TPVOne.LegacyAccess.Core.Exceptions;
 using TPVOne.LegacyAccess.Core.Import;
 using TPVOne.LegacyAccess.Core.Mapping;
 using TPVOne.LegacyAccess.Core.Models;
@@ -195,6 +196,8 @@ internal sealed class SqlServerSchemaService : ILegacySqlSchemaPort
 
     public async Task CreateIndexesAsync(
         LegacyTableSchema table,
+        string destinationTableName,
+        string? uniqueNameSuffix,
         CancellationToken cancellationToken)
     {
         await using var connection = new SqlConnection(_connectionString);
@@ -203,8 +206,67 @@ internal sealed class SqlServerSchemaService : ILegacySqlSchemaPort
             connection,
             transaction: null,
             table,
-            table.Name,
+            destinationTableName,
+            uniqueNameSuffix,
             cancellationToken);
+    }
+
+    public async Task SwapAtomicAsync(
+        string destinationTableName,
+        string stagingTableName,
+        string? backupTableName,
+        IReadOnlyList<LegacyIndexSchema> indexes,
+        string? uniqueNameSuffix,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var transaction =
+            (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            if (backupTableName is not null)
+            {
+                await RenameObjectAsync(
+                    connection,
+                    transaction,
+                    destinationTableName,
+                    backupTableName,
+                    cancellationToken);
+            }
+
+            await RenameObjectAsync(
+                connection,
+                transaction,
+                stagingTableName,
+                destinationTableName,
+                cancellationToken);
+
+            await RenameIndexesToCanonicalAsync(
+                connection,
+                transaction,
+                destinationTableName,
+                indexes,
+                uniqueNameSuffix,
+                cancellationToken);
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            try
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+            catch
+            {
+                // Conserva el error original del swap.
+            }
+
+            throw new DataImportException(
+                $"Error sustituyendo tabla '{destinationTableName}'.",
+                exception);
+        }
     }
 
     public async Task CreateIndexesAsync(
@@ -214,15 +276,36 @@ internal sealed class SqlServerSchemaService : ILegacySqlSchemaPort
         string destinationTableName,
         CancellationToken cancellationToken)
     {
-        var statements = _ddlBuilder.BuildCreateIndexSql(table, destinationTableName);
+        await CreateIndexesAsync(
+            connection,
+            transaction,
+            table,
+            destinationTableName,
+            uniqueNameSuffix: null,
+            cancellationToken);
+    }
+
+    public async Task CreateIndexesAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        LegacyTableSchema table,
+        string destinationTableName,
+        string? uniqueNameSuffix,
+        CancellationToken cancellationToken)
+    {
+        var statements = _ddlBuilder.BuildCreateIndexSql(
+            table,
+            destinationTableName,
+            uniqueNameSuffix);
         for (var index = 0; index < table.Indexes.Count; index++)
         {
             var current = table.Indexes[index];
+            var indexName = LegacyStagingNames.SuffixedIndex(current.Name, uniqueNameSuffix);
             if (await IndexExistsAsync(
                     connection,
                     transaction,
                     destinationTableName,
-                    current.Name,
+                    indexName,
                     cancellationToken))
             {
                 continue;
@@ -272,6 +355,83 @@ internal sealed class SqlServerSchemaService : ILegacySqlSchemaPort
         command.Parameters.AddWithValue("@IndexName", indexName);
         return Convert.ToInt32(
             await command.ExecuteScalarAsync(cancellationToken)) > 0;
+    }
+
+    private async Task RenameObjectAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        string currentName,
+        string newName,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            EXEC sys.sp_rename
+                @objname = @ObjName,
+                @newname = @NewName,
+                @objtype = N'OBJECT';
+            """;
+        await using var command = new SqlCommand(sql, connection, transaction)
+        {
+            CommandTimeout = _commandTimeout
+        };
+        command.Parameters.AddWithValue("@ObjName", $"dbo.{currentName}");
+        command.Parameters.AddWithValue("@NewName", newName);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private async Task RenameIndexesToCanonicalAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        string tableName,
+        IReadOnlyList<LegacyIndexSchema> indexes,
+        string? uniqueNameSuffix,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(uniqueNameSuffix))
+        {
+            return;
+        }
+
+        foreach (var index in indexes)
+        {
+            var currentName = LegacyStagingNames.SuffixedIndex(index.Name, uniqueNameSuffix);
+            if (string.Equals(currentName, index.Name, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (index.IsPrimaryKey)
+            {
+                const string renameConstraint = """
+                    EXEC sys.sp_rename
+                        @objname = @ObjName,
+                        @newname = @NewName,
+                        @objtype = N'OBJECT';
+                    """;
+                await using var command = new SqlCommand(renameConstraint, connection, transaction)
+                {
+                    CommandTimeout = _commandTimeout
+                };
+                command.Parameters.AddWithValue("@ObjName", $"dbo.{currentName}");
+                command.Parameters.AddWithValue("@NewName", index.Name);
+                await command.ExecuteNonQueryAsync(cancellationToken);
+                continue;
+            }
+
+            const string renameIndex = """
+                EXEC sys.sp_rename
+                    @objname = @ObjName,
+                    @newname = @NewName,
+                    @objtype = N'INDEX';
+                """;
+            await using var indexCommand = new SqlCommand(renameIndex, connection, transaction)
+            {
+                CommandTimeout = _commandTimeout
+            };
+            indexCommand.Parameters.AddWithValue("@ObjName", $"dbo.{tableName}.{currentName}");
+            indexCommand.Parameters.AddWithValue("@NewName", index.Name);
+            await indexCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
     }
 
     private sealed record IndexRow(

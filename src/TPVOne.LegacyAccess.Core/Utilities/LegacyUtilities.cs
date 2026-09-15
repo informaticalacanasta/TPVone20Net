@@ -4,10 +4,48 @@ namespace TPVOne.LegacyAccess.Core.Utilities;
 
 public static class SqlIdentifier
 {
+    public const int MaxLength = 128;
+
     public static string Quote(string identifier)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(identifier);
         return $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
+    }
+
+    public static string Fit(string identifier)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(identifier);
+        return identifier.Length <= MaxLength
+            ? identifier
+            : identifier[..MaxLength];
+    }
+}
+
+public static class LegacyStagingNames
+{
+    public static string NewToken()
+    {
+        return Guid.NewGuid().ToString("N");
+    }
+
+    public static string StagingTable(string tableName, string token)
+    {
+        return SqlIdentifier.Fit($"{tableName}__s{token}");
+    }
+
+    public static string BackupTable(string tableName, string token)
+    {
+        return SqlIdentifier.Fit($"{tableName}__b{token}");
+    }
+
+    public static string SuffixedIndex(string indexName, string? suffix)
+    {
+        if (string.IsNullOrEmpty(suffix))
+        {
+            return indexName;
+        }
+
+        return SqlIdentifier.Fit($"{indexName}__{suffix}");
     }
 }
 

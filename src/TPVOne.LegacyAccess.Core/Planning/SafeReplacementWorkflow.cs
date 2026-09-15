@@ -83,20 +83,35 @@ public sealed class SafeReplacementWorkflow
 
             if (destinationExisted)
             {
-                await operations.DropIfExistsAsync(backupTableName, cancellationToken);
+                try
+                {
+                    await operations.DropIfExistsAsync(backupTableName, cancellationToken);
+                }
+                catch
+                {
+                    // El swap ya confirmó la tabla definitiva; un backup huérfano no revierte el éxito.
+                }
             }
 
             return counted;
         }
-        catch
+        catch (Exception exception)
         {
+            Exception? cleanup = null;
             try
             {
                 await operations.DropIfExistsAsync(stagingTableName, CancellationToken.None);
             }
-            catch
+            catch (Exception cleanupException)
             {
-                // Conserva el error original de creación/importación.
+                cleanup = cleanupException;
+            }
+
+            if (cleanup is not null)
+            {
+                throw new DataImportException(
+                    $"{exception.Message} Además no se pudo eliminar la tabla staging '{stagingTableName}'.",
+                    new AggregateException(exception, cleanup));
             }
 
             throw;

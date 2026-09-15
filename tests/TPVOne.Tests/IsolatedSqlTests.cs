@@ -1,5 +1,6 @@
 using System.Text;
 using Microsoft.Data.SqlClient;
+using TPVOne.LegacyAccess.Core.Exceptions;
 using TPVOne.LegacyAccess.Core.Import;
 using TPVOne.LegacyAccess.Core.Mapping;
 using TPVOne.LegacyAccess.Core.Models;
@@ -156,58 +157,289 @@ public sealed class IsolatedSqlTests
     }
 
     [SqlFact]
-    public async Task IdenticalSecondImport_DeclineKeepsExistingRows()
+    public async Task IdenticalSecondImport_SameHash_IsSkipped()
     {
         await using var database = await IsolatedSqlDatabase.CreateAsync();
         using var source = AlergenosFixture.CreateWithCsv();
 
         var first = await ImportAsync(database, source.Path);
-        var second = await ImportAsync(database, source.Path, ScriptedOverwrite.With(false));
+        var second = await ImportAsync(database, source.Path);
         var rows = await database.CountRowsAsync("alergenos");
         var history = await database.ReadHistoryStatusesAsync("alergenos");
 
         Assert.Equal(ImportStatus.Success, first.Tables[0].Status);
         Assert.Equal(DataStatus.Imported, first.Tables[0].DataStatus);
         Assert.Equal(2, first.Tables[0].ImportedRowCount);
-        Assert.Equal(ImportStatus.SkippedByUser, second.Tables[0].Status);
-        Assert.Equal(DataStatus.NotProcessed, second.Tables[0].DataStatus);
+        Assert.Equal(ImportStatus.SkippedAlreadyImported, second.Tables[0].Status);
+        Assert.Equal(DataStatus.AlreadyImported, second.Tables[0].DataStatus);
         Assert.Equal(0, second.Tables[0].ImportedRowCount);
         Assert.Equal(2, rows);
         Assert.Equal(
-            ["Success", "SkippedByUser"],
+            ["Success", "SkippedAlreadyImported"],
             history);
+        Assert.DoesNotContain(
+            await database.ListUserTablesAsync(),
+            name => name.Contains("__s", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("__b", StringComparison.OrdinalIgnoreCase));
     }
 
     [SqlFact]
-    public async Task ExistingRows_OverwriteDropsAndReimports()
+    public async Task ExistingRows_OverwriteReplacesViaStaging()
     {
         await using var database = await IsolatedSqlDatabase.CreateAsync();
         using var source = AlergenosFixture.CreateWithCsv();
         await ImportAsync(database, source.Path);
         await database.ExecuteAsync(
             "INSERT INTO dbo.alergenos (id_alergeno, DESCRIPCIO) VALUES (99, N'EXTRA');");
+        File.WriteAllText(
+            Path.Combine(source.Path, "alergenos.csv"),
+            "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|GLUTEN||\n2|HUEVOS||\n3|LACTOSA||\n");
 
         var overwritten = await ImportAsync(database, source.Path, ScriptedOverwrite.With(true));
         var rows = await database.CountRowsAsync("alergenos");
         var history = await database.ReadHistoryStatusesAsync("alergenos");
+        var tables = await database.ListUserTablesAsync();
 
         Assert.Equal(SchemaStatus.Replaced, overwritten.Tables[0].SchemaStatus);
         Assert.Equal(DataStatus.Imported, overwritten.Tables[0].DataStatus);
-        Assert.Equal(2, overwritten.Tables[0].ImportedRowCount);
-        Assert.Equal(2, rows);
+        Assert.Equal(3, overwritten.Tables[0].ImportedRowCount);
+        Assert.Equal(3, rows);
         Assert.Equal(
             ["Success", "Success"],
             history);
+        Assert.DoesNotContain(
+            tables,
+            name => name.Contains("__s", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("__b", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("id_alergeno", await database.ListIndexNamesAsync("alergenos"));
+    }
+
+    [SqlFact]
+    public async Task NewTable_LeavesNoStaging()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        var result = await ImportAsync(database, source.Path);
+
+        Assert.Equal(SchemaStatus.Created, result.Tables[0].SchemaStatus);
+        Assert.Equal(DataStatus.Imported, result.Tables[0].DataStatus);
+        Assert.Equal(2, await database.CountRowsAsync("alergenos"));
+        Assert.DoesNotContain(
+            await database.ListUserTablesAsync(),
+            name => name.Contains("__s", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [SqlFact]
+    public async Task EmptyExistingTable_ReplacesViaStaging()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+        await database.ExecuteAsync("DELETE FROM dbo.alergenos;");
+        File.WriteAllText(
+            Path.Combine(source.Path, "alergenos.csv"),
+            "id_alergeno|DESCRIPCIO|FOTO_activado|\n10|SESAMO||\n");
+
+        var result = await ImportAsync(database, source.Path, ScriptedOverwrite.With(true));
+        Assert.Equal(SchemaStatus.Replaced, result.Tables[0].SchemaStatus);
+        Assert.Equal(1, await database.CountRowsAsync("alergenos"));
+    }
+
+    [SqlFact]
+    public async Task BulkFailsOnLaterBatch_LeavesOriginal()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+        File.WriteAllText(
+            Path.Combine(source.Path, "alergenos.csv"),
+            "id_alergeno|DESCRIPCIO|FOTO_activado|\n" +
+            string.Join(
+                "\n",
+                Enumerable.Range(1, 12).Select(index =>
+                    index == 11
+                        ? "X|FAIL||"
+                        : $"{index}|OK{index}||")));
+
+        var failed = await ImportAsync(
+            database,
+            source.Path,
+            ScriptedOverwrite.With(true),
+            batchSize: 5);
+        var rows = await database.CountRowsAsync("alergenos");
+        var tables = await database.ListUserTablesAsync();
+
+        Assert.Equal(DataStatus.Failed, failed.Tables[0].DataStatus);
+        Assert.Equal(2, rows);
+        Assert.Contains("alergenos", tables, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain(
+            tables,
+            name => name.Contains("__s", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("GLUTEN", await database.ReadNVarCharAsync("alergenos", "DESCRIPCIO", "id_alergeno", 1));
+    }
+
+    [SqlFact]
+    public async Task DuplicateUniqueIndex_AbortsBeforeSwap()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+        File.WriteAllText(
+            Path.Combine(source.Path, "alergenos.csv"),
+            "id_alergeno|DESCRIPCIO|FOTO_activado|\n1|A||\n1|B||\n");
+
+        var failed = await ImportAsync(database, source.Path, ScriptedOverwrite.With(true));
+        Assert.Equal(DataStatus.Failed, failed.Tables[0].DataStatus);
+        Assert.Equal(2, await database.CountRowsAsync("alergenos"));
+        Assert.Equal("GLUTEN", await database.ReadNVarCharAsync("alergenos", "DESCRIPCIO", "id_alergeno", 1));
+        Assert.DoesNotContain(
+            await database.ListUserTablesAsync(),
+            name => name.Contains("__s", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [SqlFact]
+    public async Task SwapFailure_RollsBackOriginalTable()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+        var schema = new SqlServerSchemaService(
+            database.ConnectionString,
+            new DaoToSqlTypeMapper(),
+            30);
+
+        await Assert.ThrowsAsync<DataImportException>(() =>
+            schema.SwapAtomicAsync(
+                "alergenos",
+                "missing_staging_table",
+                "alergenos__btest",
+                [],
+                "test",
+                CancellationToken.None));
+
+        Assert.Equal(2, await database.CountRowsAsync("alergenos"));
+        Assert.Contains("alergenos", await database.ListUserTablesAsync(), StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain("alergenos__btest", await database.ListUserTablesAsync(), StringComparer.OrdinalIgnoreCase);
+        Assert.Equal("GLUTEN", await database.ReadNVarCharAsync("alergenos", "DESCRIPCIO", "id_alergeno", 1));
+    }
+
+    [SqlFact]
+    public async Task MultipleBatches_ImportAllRows()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateSchemaOnly();
+        var csv = new StringBuilder("id_alergeno|DESCRIPCIO|FOTO_activado|\n");
+        for (var index = 1; index <= 12; index++)
+        {
+            csv.AppendLine($"{index}|N{index}||");
+        }
+
+        File.WriteAllText(Path.Combine(source.Path, "alergenos.csv"), csv.ToString());
+        var options = new LegacyImportOptions
+        {
+            SourceDirectory = source.Path,
+            BatchSize = 5,
+            CommandTimeoutSeconds = 30
+        };
+        var mapper = new DaoToSqlTypeMapper();
+        var schema = new SqlServerSchemaService(database.ConnectionString, mapper, 30);
+        var bulk = new SqlBulkImporter(database.ConnectionString, schema, options);
+        var table = new TPVOne.LegacyAccess.Core.Parsing.TxtTableStructureParser()
+            .Parse(File.ReadAllText(Path.Combine(source.Path, "alergenos.txt")));
+        await schema.CreateTableAsync(table, "alergenos__sbatch", CancellationToken.None);
+        var data = new CsvLegacyDataSource(Path.Combine(source.Path, "alergenos.csv"));
+        var copied = await bulk.CopyAsync(
+            table,
+            data,
+            "alergenos__sbatch",
+            12,
+            progress: null,
+            CancellationToken.None);
+
+        Assert.Equal(12, copied.RowsCopied);
+        Assert.Equal(3, copied.BatchCount);
+        Assert.Equal(12, await database.CountRowsAsync("alergenos__sbatch"));
+    }
+
+    [SqlFact]
+    public async Task SameHash_ForceImportReimports()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+        var forced = await ImportAsync(
+            database,
+            source.Path,
+            ScriptedOverwrite.With(true),
+            forceImport: true);
+        Assert.Equal(DataStatus.Imported, forced.Tables[0].DataStatus);
+        Assert.Equal(SchemaStatus.Replaced, forced.Tables[0].SchemaStatus);
+        Assert.Equal(2, await database.CountRowsAsync("alergenos"));
+    }
+
+    [SqlFact]
+    public async Task CancellationDuringBulk_LeavesOriginal()
+    {
+        await using var database = await IsolatedSqlDatabase.CreateAsync();
+        using var source = AlergenosFixture.CreateWithCsv();
+        await ImportAsync(database, source.Path);
+        var csv = new StringBuilder("id_alergeno|DESCRIPCIO|FOTO_activado|\n");
+        for (var index = 1; index <= 40; index++)
+        {
+            csv.AppendLine($"{index}|N{index}||");
+        }
+
+        File.WriteAllText(Path.Combine(source.Path, "alergenos.csv"), csv.ToString());
+        using var cts = new CancellationTokenSource();
+        var options = new LegacyImportOptions
+        {
+            SourceDirectory = source.Path,
+            BatchSize = 5,
+            CommandTimeoutSeconds = 30
+        };
+        var mapper = new DaoToSqlTypeMapper();
+        var schemaService = new SqlServerSchemaService(database.ConnectionString, mapper, 30);
+        var bulk = new SqlBulkImporter(database.ConnectionString, schemaService, options);
+        await schemaService.CreateTableAsync(
+            new TPVOne.LegacyAccess.Core.Parsing.TxtTableStructureParser()
+                .Parse(File.ReadAllText(Path.Combine(source.Path, "alergenos.txt"))),
+            "alergenos__scancel",
+            CancellationToken.None);
+        var progress = new Progress<LegacyCopyProgress>(update =>
+        {
+            if (update.BatchCount >= 1)
+            {
+                cts.Cancel();
+            }
+        });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            bulk.CopyAsync(
+                new TPVOne.LegacyAccess.Core.Parsing.TxtTableStructureParser()
+                    .Parse(File.ReadAllText(Path.Combine(source.Path, "alergenos.txt"))),
+                new CsvLegacyDataSource(Path.Combine(source.Path, "alergenos.csv")),
+                "alergenos__scancel",
+                40,
+                progress,
+                cts.Token));
+
+        Assert.Equal(2, await database.CountRowsAsync("alergenos"));
+        Assert.Equal("GLUTEN", await database.ReadNVarCharAsync("alergenos", "DESCRIPCIO", "id_alergeno", 1));
     }
 
     private static async Task<PipelineResult> ImportAsync(
         IsolatedSqlDatabase database,
         string sourceDirectory,
-        ILegacyImportInteraction? interaction = null)
+        ILegacyImportInteraction? interaction = null,
+        bool forceImport = false,
+        int batchSize = 5000)
     {
         var options = new LegacyImportOptions
         {
-            SourceDirectory = sourceDirectory
+            SourceDirectory = sourceDirectory,
+            ForceImport = forceImport,
+            BatchSize = batchSize,
+            CommandTimeoutSeconds = 30
         };
         var mapper = new DaoToSqlTypeMapper();
         var schema = new SqlServerSchemaService(database.ConnectionString, mapper, 30);
@@ -456,6 +688,29 @@ internal sealed class IsolatedSqlDatabase : IAsyncDisposable
         }
 
         return tables;
+    }
+
+    public async Task<IReadOnlyList<string>> ListIndexNamesAsync(string tableName)
+    {
+        const string sql = """
+            SELECT i.name
+            FROM sys.indexes i
+            WHERE i.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(@TableName), N'U')
+              AND i.name IS NOT NULL
+            ORDER BY i.name;
+            """;
+        var names = new List<string>();
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.AddWithValue("@TableName", tableName);
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            names.Add(reader.GetString(0));
+        }
+
+        return names;
     }
 
     public async Task<(string TypeName, short MaxLength)> ReadColumnTypeAsync(
